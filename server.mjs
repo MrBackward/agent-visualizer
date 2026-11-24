@@ -6,11 +6,12 @@ import { homedir } from 'node:os';
 import { basename, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
+import { listWorktrees, portFor } from './repo.mjs';
 
 const { values: options } = parseArgs({
   options: {
     repo: { type: 'string', default: process.cwd() },
-    port: { type: 'string', default: '4777' },
+    port: { type: 'string' },
     minutes: { type: 'string', default: '60' },
   },
 });
@@ -92,15 +93,7 @@ function emit(event) {
 }
 
 function refreshWorktrees() {
-  const next = execFileSync('git', ['-C', options.repo, 'worktree', 'list', '--porcelain'], { encoding: 'utf8' })
-    .trim()
-    .split('\n\n')
-    .map((block, index) => {
-      const root = /^worktree (.+)$/m.exec(block)?.[1];
-      const branch = /^branch refs\/heads\/(.+)$/m.exec(block)?.[1] ?? 'detached';
-      return root && { root, name: basename(root), branch, primary: index === 0 };
-    })
-    .filter(Boolean);
+  const next = listWorktrees(options.repo);
   const changed = JSON.stringify(next) !== JSON.stringify(worktrees);
   worktrees = next;
   if (changed) broadcast({ type: 'worktrees', worktrees: publicWorktrees() });
@@ -309,6 +302,7 @@ try {
   console.error(`Not a git repository: ${options.repo}`);
   process.exit(1);
 }
+const port = Number(options.port ?? portFor(worktrees[0].root));
 scan();
 drainAll();
 events.sort((first, second) => first.ts - second.ts);
@@ -335,7 +329,7 @@ createServer((request, response) => {
   response.write(`data: ${JSON.stringify(init)}\n\n`);
   clients.add(response);
   request.on('close', () => clients.delete(response));
-}).listen(Number(options.port), '127.0.0.1', () => {
+}).listen(port, '127.0.0.1', () => {
   console.log(`Agent visualizer for ${worktrees[0].root}`);
-  console.log(`http://127.0.0.1:${options.port}`);
+  console.log(`http://127.0.0.1:${port}`);
 });
