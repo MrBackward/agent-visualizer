@@ -19,22 +19,24 @@
   h2 small { font-weight: 400; color: var(--muted); overflow: hidden; text-overflow: ellipsis; min-width: 0; }
   #status { color: var(--muted); font-size: 11px; white-space: nowrap; }
   #status::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; background: var(--muted); }
-  #status.live::before { background: #0ca30c; box-shadow: 0 0 8px #0ca30c; }
+  #status.live::before { background: var(--done); box-shadow: 0 0 8px var(--done); }
   #summary { color: var(--ink2); margin: 2px 0 0; }
-  .row { display: grid; grid-template-columns: 1fr auto; gap: 6px; align-items: center; width: 100%; padding: 3px 4px; margin: 0 -4px; border: 0; border-radius: 6px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+  .row { display: grid; grid-template-columns: 10px 1fr auto; gap: 7px; align-items: center; width: 100%; padding: 3px 4px; margin: 0 -4px; border: 0; border-radius: 6px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
   .row:hover, .row.pinned { background: var(--axis); }
-  .idle { opacity: 0.55; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
   .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ago { color: var(--muted); font-variant-numeric: tabular-nums; }
-  .detail { display: flex; gap: 6px; align-items: center; color: var(--muted); padding-left: 8px; }
+  .state { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .detail { display: flex; gap: 6px; align-items: center; color: var(--muted); padding-left: 17px; }
   .detail span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; min-width: 0; }
-  .sub { color: var(--ink2); padding-left: 8px; display: flex; gap: 6px; justify-content: space-between; }
+  .sub { color: var(--ink2); padding-left: 17px; display: grid; grid-template-columns: 8px 1fr auto; gap: 6px; align-items: center; }
+  .sub .dot { width: 7px; height: 7px; }
   .overlap { display: block; width: 100%; padding: 4px; margin: 0 -4px; border: 0; border-radius: 6px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
   .overlap:hover { background: var(--axis); }
   .overlap b { font-weight: 600; word-break: break-all; }
   .overlap span { display: block; color: var(--muted); }
   #key { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--axis); color: var(--ink2); }
   #key span { display: inline-flex; align-items: center; gap: 6px; }
+  #key p { flex-basis: 100%; margin: 4px 0 0; color: var(--muted); }
   .mark { width: 9px; height: 9px; flex: none; display: inline-block; }
   .mark.read { border: 1.5px solid var(--read); border-radius: 50%; }
   .mark.modify { background: var(--modify); border-radius: 50%; }
@@ -55,16 +57,21 @@
 <canvas id="stage"></canvas>
 <div id="empty">Waiting for agent activity…</div>
 <aside id="panel" class="card">
-  <header><h1 id="repo">Agent Visualizer</h1><span id="status">connecting</span></header>
+  <header><h1>Agent Visualizer</h1><span id="status">connecting</span></header>
   <p id="summary"></p>
   <section id="agents"></section>
   <section id="overlaps"></section>
   <div id="key">
+    <p>Files</p>
     <span><i class="mark read"></i>read</span>
     <span><i class="mark write"></i>write (new file)</span>
     <span><i class="mark modify"></i>modify</span>
     <span><i class="mark delete"></i>delete</span>
     <span><i class="mark overlapped"></i>changed in two worktrees</span>
+    <p>Agents</p>
+    <span><i class="dot" style="background: var(--ink)"></i>working</span>
+    <span><i class="dot" style="background: var(--stuck)"></i>still for 5+ min</span>
+    <span><i class="dot" style="background: var(--done)"></i>done</span>
   </div>
 </aside>
 <div id="controls" class="card">
@@ -75,13 +82,12 @@
     <option value="60">1 hour</option>
     <option value="all">Everything loaded</option>
   </select>
-  <button id="fit" title="Fit the tree to the window (F)">Fit</button>
+  <button id="fit" title="Fit the trees to the window (F)">Fit</button>
 </div>
 <div id="tooltip" class="card" hidden></div>
 
 <script>
 const TAU = Math.PI * 2;
-const LIVE_MS = 90_000;
 const ZAP_MS = 1300;
 const BOLT_MS = 560;
 const LONGEST_BOLT_MS = 3200;
@@ -93,6 +99,9 @@ const TRAVEL_EASE_MS = 320;
 const DRIFT_EASE_MS = 600;
 const STAND_OFF = 62;
 const QUEUE_LIMIT = 8;
+const STUCK_AFTER_MS = 5 * 60_000;
+const SETTLE_MS = 10_000;
+const STILL_LABEL_MS = 30_000;
 const HEAT_MS = 10_000;
 const POP_MS = 450;
 const HOT_LABEL_MS = 45_000;
@@ -103,34 +112,39 @@ const PANEL_INSET = 316;
 const CLEARANCE = 22;
 const REPEL_RANGE = 60;
 const BRANCH_LENGTH = 34;
+const TREE_GAP = 90;
 const WARM_UP_STEPS = 2000;
 const FONT = '11px system-ui, -apple-system, "Segoe UI", sans-serif';
+const ROOT_FONT = `600 13px system-ui, -apple-system, "Segoe UI", sans-serif`;
 const ACTIONS = ['write', 'modify', 'delete', 'read'];
 const theme = {
   page: '#0d0d0d', surface: '#1a1a19', ink: '#f0efec', ink2: '#c3c2b7', muted: '#898781', axis: '#383835',
   read: '#d17d10', write: '#199e70', modify: '#3987e5', delete: '#c93434',
+  done: '#0ca30c', stuck: '#d03b3b',
 };
 Object.entries(theme).forEach(([name, value]) => document.documentElement.style.setProperty(`--${name}`, value));
 
 const canvas = document.getElementById('stage');
 const context = canvas.getContext('2d');
 const elements = Object.fromEntries(
-  ['repo', 'status', 'summary', 'agents', 'overlaps', 'tooltip', 'empty', 'trail', 'fit'].map((id) => [id, document.getElementById(id)]),
+  ['status', 'summary', 'agents', 'overlaps', 'tooltip', 'empty', 'trail', 'fit'].map((id) => [id, document.getElementById(id)]),
 );
 
 const view = { width: 0, height: 0, x: 0, y: 0, k: 1, autoFit: true };
-let repo = '';
-let worktrees = new Map();
+let repos = new Map();
+let repoOrder = [];
 let agents = new Map();
 let nodes = new Map();
 let previousNodes = new Map();
 let dirs = [];
 let shown = [];
+let trees = [];
 let files = [];
 let log = [];
 let zaps = [];
-let overlapPaths = new Set();
+let overlapKeys = new Set();
 let trailMs = 15 * 60_000;
+let lookbackMs = 60 * 60_000;
 let pinnedSession = null;
 let hoveredSession = null;
 let hoveredNode = null;
@@ -145,7 +159,10 @@ const clamp = (value, low, high) => Math.min(Math.max(value, low), high);
 const noise = (seed) => Math.abs(Math.sin(seed * 12.9898) * 43758.5453) % 1;
 const wake = () => { wakeUntil = performance.now() + 6000; };
 const cutoffNow = () => Date.now() - trailMs;
+const keyOf = (repo, path) => `${repo}\n${path}`;
 const sessionOf = (agent) => agent.parent ?? agent.id;
+const isPresent = (agent, now) => now - Math.max(agent.lastTs, agent.statusAt ?? 0) < lookbackMs;
+const stillSince = (agent) => Math.max(agent.lastTs, agent.restedAt ?? 0);
 // 25 lines hold the bolt about 0.8s, 400 lines about 2s.
 const boltDuration = (lines) => (lines ? clamp(350 + Math.sqrt(lines) * 85, 450, LONGEST_BOLT_MS) : BOLT_MS);
 const toScreen = (point) => ({ x: (point.x - view.x) * view.k + view.width / 2, y: (point.y - view.y) * view.k + view.height / 2 });
@@ -164,8 +181,17 @@ function angleOf(text) {
   return (hash / 3600) * TAU;
 }
 
+// e.g. mix('#f0efec', '#d03b3b', 0.5) is halfway from white to red
+function mix(from, to, amount) {
+  const channel = (hex, index) => parseInt(hex.slice(1 + index * 2, 3 + index * 2), 16);
+  const blended = [0, 1, 2].map((index) => Math.round(channel(from, index) + (channel(to, index) - channel(from, index)) * amount));
+  return `rgb(${blended.join(', ')})`;
+}
+
 function getAgent(id) {
-  if (!agents.has(id)) agents.set(id, { id, parent: null, title: null, agentType: null, description: null, lastTs: 0, lastEvent: null, node: null, x: 0, y: 0 });
+  if (!agents.has(id)) {
+    agents.set(id, { id, parent: null, title: null, agentType: null, description: null, status: null, statusAt: 0, lastTs: 0, lastEvent: null, node: null, x: 0, y: 0, placed: false, moving: false });
+  }
   return agents.get(id);
 }
 
@@ -174,27 +200,42 @@ function agentLabel(agent) {
   return agent.title ?? `Session ${agent.id.slice(0, 8)}`;
 }
 
-function createNode(path, dir) {
+// White while it works, green once its turn is over, red once it has sat still mid-turn for five minutes.
+function agentColour(agent, now) {
+  if (agent.moving) return theme.ink;
+  if (agent.status === 'done') return theme.done;
+  return mix(theme.ink, theme.stuck, clamp((now - stillSince(agent) - STUCK_AFTER_MS) / SETTLE_MS, 0, 1));
+}
+
+function agentState(agent, now) {
+  if (agent.status === 'done') return `done ${ago(Math.max(agent.statusAt ?? 0, agent.lastTs))}`;
+  if (agent.moving) return 'moving';
+  return now - stillSince(agent) > STILL_LABEL_MS ? `still ${ago(stillSince(agent))}` : 'working';
+}
+
+function createNode(repo, path, dir) {
   const slash = path.lastIndexOf('/');
-  const parent = path === '' ? null : ensureNode(path.slice(0, Math.max(slash, 0)), true);
-  const before = previousNodes.get(path);
+  const parent = path === '' ? null : ensureNode(repo, path.slice(0, Math.max(slash, 0)), true);
+  const key = keyOf(repo, path);
+  const before = previousNodes.get(key);
   const node = {
-    path, dir, parent,
+    key, repo, path, dir, parent,
     name: path === '' ? repo : path.slice(slash + 1),
     x: before?.x ?? parent?.x ?? 0,
     y: before?.y ?? parent?.y ?? 0,
     vx: 0, vy: 0, offsetX: 0, offsetY: 0, radius: DIR_RADIUS,
-    seeded: Boolean(before?.seeded), hidden: false, label: '', layoutParent: null, layoutChildren: [],
+    seeded: Boolean(before?.seeded), hidden: false, label: '', layoutParent: null, layoutChildren: [], tree: null,
     files: [], children: [], dirty: false,
     touches: new Map(), sessions: new Set(), writers: new Map(),
     lastTs: 0, state: 'read',
     bornAt: replaying || dir ? -Infinity : Infinity, flashAt: -Infinity,
   };
-  nodes.set(path, node);
+  nodes.set(key, node);
   layoutDirty = true;
   if (dir) {
     dirs.push(node);
     parent?.children.push(node);
+    if (!parent && !repoOrder.includes(repo)) repoOrder.push(repo);
   } else {
     files.push(node);
     parent.files.push(node);
@@ -203,10 +244,10 @@ function createNode(path, dir) {
   return node;
 }
 
-const ensureNode = (path, dir) => nodes.get(path) ?? createNode(path, dir);
+const ensureNode = (repo, path, dir) => nodes.get(keyOf(repo, path)) ?? createNode(repo, path, dir);
 
 function applyEvent(event, animate) {
-  const node = ensureNode(event.path, event.dir);
+  const node = ensureNode(event.repo, event.path, event.dir);
   const agent = getAgent(event.agent);
   const touch = node.touches.get(agent.id) ?? { read: 0, write: 0, modify: 0, delete: 0, ts: 0 };
   touch[event.kind] += 1;
@@ -226,12 +267,18 @@ function applyEvent(event, animate) {
     agent.lastEvent = event;
     agent.node = node;
   }
-  if (animate) zaps.push({ path: event.path, agent: agent.id, kind: event.kind, via: event.via, queuedAt: performance.now(), start: null, boltMs: boltDuration(event.lines), seed: Math.random() * 1000 });
+  if (animate) zaps.push({ key: node.key, agent: agent.id, kind: event.kind, via: event.via, queuedAt: performance.now(), start: null, boltMs: boltDuration(event.lines), seed: Math.random() * 1000 });
 }
 
 function rebuild() {
   const cutoff = cutoffNow();
+  const now = Date.now();
   if (log.length > 60_000) log = log.slice(-50_000);
+  // Each agent's last action outlives the trail, so the agent stays parked where it last was.
+  const latest = new Map();
+  log.forEach((event) => { if (!(latest.get(event.agent)?.ts > event.ts)) latest.set(event.agent, event); });
+  const anchors = new Set([...latest.values()].filter((event) => now - Math.max(event.ts, getAgent(event.agent).statusAt ?? 0) < lookbackMs));
+  const firstLoad = !nodes.size;
   previousNodes = nodes;
   nodes = new Map();
   dirs = [];
@@ -240,21 +287,26 @@ function rebuild() {
   elements.tooltip.hidden = true;
   agents.forEach((agent) => Object.assign(agent, { lastTs: 0, lastEvent: null, node: null }));
   replaying = true;
-  ensureNode('', true);
-  log.filter((event) => event.ts >= cutoff).forEach((event) => applyEvent(event, false));
+  log.filter((event) => event.ts >= cutoff || anchors.has(event)).forEach((event) => applyEvent(event, false));
   replaying = false;
   previousNodes = new Map();
+  layoutDirty = true;
   settleStructure();
   Array.from({ length: WARM_UP_STEPS }).some(() => relax() < 0.05);
+  if (firstLoad) arrangeTrees();
   files.forEach((file) => Object.assign(file, { x: file.parent.x + file.offsetX, y: file.parent.y + file.offsetY }));
+  if (firstLoad) fitCamera(1);
   panelDirty = true;
   wake();
 }
 
 function expire() {
   const cutoff = cutoffNow();
-  const expired = (node) => node.lastTs > 0 && node.lastTs < cutoff;
-  if (files.some(expired) || dirs.some(expired)) rebuild();
+  const now = Date.now();
+  const parked = [...agents.values()].filter((agent) => agent.node);
+  const occupied = new Set(parked.map((agent) => agent.node));
+  const stale = (node) => node.lastTs > 0 && node.lastTs < cutoff && !occupied.has(node);
+  if (parked.some((agent) => !isPresent(agent, now)) || files.some(stale) || dirs.some(stale)) rebuild();
 }
 
 function arrange(dir) {
@@ -275,14 +327,14 @@ function arrange(dir) {
   });
   dir.radius = dir.files.length ? RING_START + ring * RING_GAP + 7 : DIR_RADIUS;
   dir.dirty = false;
+  layoutDirty = true;
 }
 
 // A new folder takes the roomiest spot pointing away from its grandparent, so adding it never moves the rest of the tree.
 function seedDir(dir) {
   dir.seeded = true;
   const parent = dir.layoutParent;
-  if (!parent) return;
-  const formerChild = dirs.find((other) => other.seeded && other !== dir && other.layoutParent === parent && other.path.startsWith(`${dir.path}/`));
+  const formerChild = dirs.find((other) => other.seeded && other !== dir && other.repo === dir.repo && other.layoutParent === parent && other.path.startsWith(`${dir.path}/`));
   if (formerChild) {
     Object.assign(dir, { x: (parent.x + formerChild.x) / 2, y: (parent.y + formerChild.y) / 2 });
     return;
@@ -303,8 +355,8 @@ function seedDir(dir) {
   Object.assign(dir, { x: roomiest.x, y: roomiest.y });
 }
 
-// First load only: a radial tree gives every subtree its own wedge, so the starting picture has no crossed branches.
-function seedAll() {
+// First load of a repo only: a radial tree gives every subtree its own wedge, so the starting picture has no crossed branches.
+function seedAll({ root }) {
   const levels = [];
   const weightOf = (list) => list.reduce((sum, dir) => sum + dir.weight, 0);
   const weigh = (dir, level) => {
@@ -324,10 +376,10 @@ function seedAll() {
       cursor += child.weight * share;
     });
   };
-  const root = nodes.get('');
   weigh(root, 0);
   spread(root, 0, TAU);
 
+  const centre = { x: root.x, y: root.y };
   const widest = (level) => Math.max(...level.map((dir) => dir.radius));
   let distance = 0;
   levels.forEach((level, index) => {
@@ -335,7 +387,7 @@ function seedAll() {
       const fitsArc = Math.max(...level.map((dir) => (dir.radius * 2 + CLEARANCE) / dir.sweep));
       distance = Math.max(distance + widest(levels[index - 1]) + widest(level) + BRANCH_LENGTH, fitsArc);
     }
-    level.forEach((dir) => Object.assign(dir, { x: Math.cos(dir.angle) * distance, y: Math.sin(dir.angle) * distance, seeded: true }));
+    level.forEach((dir) => Object.assign(dir, { x: centre.x + Math.cos(dir.angle) * distance, y: centre.y + Math.sin(dir.angle) * distance, seeded: true }));
   });
 }
 
@@ -344,31 +396,84 @@ function settleStructure() {
   if (!layoutDirty) return;
   layoutDirty = false;
   shown = [];
-  const firstLoad = !dirs.some((dir) => dir.seeded && dir.parent);
-  const visit = (dir, layoutParent, prefix) => {
-    const passThrough = dir.parent && !dir.files.length && dir.children.length === 1 && !dir.lastTs;
-    dir.hidden = Boolean(passThrough);
-    if (passThrough) {
-      visit(dir.children[0], layoutParent, `${prefix}${dir.name}/`);
-      return;
-    }
-    dir.label = `${prefix}${dir.name}`;
-    dir.layoutParent = layoutParent;
-    dir.layoutChildren = [];
-    layoutParent?.layoutChildren.push(dir);
-    if (!dir.seeded && !firstLoad) {
-      seedDir(dir);
-      dir.files.forEach((file) => Object.assign(file, { x: dir.x, y: dir.y }));
-    }
-    shown.push(dir);
-    dir.children.forEach((child) => visit(child, dir, ''));
-  };
-  visit(nodes.get(''), null, '');
-  if (firstLoad) seedAll();
+  trees = dirs
+    .filter((dir) => !dir.parent)
+    .sort((first, second) => repoOrder.indexOf(first.repo) - repoOrder.indexOf(second.repo))
+    .map((root) => {
+      const tree = { root, dirs: [] };
+      const firstLoad = !dirs.some((dir) => dir.seeded && dir.parent && dir.repo === root.repo);
+      if (!root.seeded) {
+        const placed = dirs.filter((dir) => dir.seeded && !dir.hidden);
+        const neighbour = placed.findLast((dir) => !dir.parent);
+        Object.assign(root, { x: placed.length ? Math.max(...placed.map((dir) => dir.x + dir.radius)) + TREE_GAP * 1.5 : 0, y: neighbour?.y ?? 0, seeded: true });
+      }
+      const visit = (dir, layoutParent, prefix) => {
+        const passThrough = dir.parent && !dir.files.length && dir.children.length === 1 && !dir.lastTs;
+        dir.hidden = Boolean(passThrough);
+        if (passThrough) {
+          visit(dir.children[0], layoutParent, `${prefix}${dir.name}/`);
+          return;
+        }
+        Object.assign(dir, { label: `${prefix}${dir.name}`, layoutParent, layoutChildren: [], tree });
+        layoutParent?.layoutChildren.push(dir);
+        if (!dir.seeded && !firstLoad) {
+          seedDir(dir);
+          dir.files.forEach((file) => Object.assign(file, { x: dir.x, y: dir.y }));
+        }
+        tree.dirs.push(dir);
+        shown.push(dir);
+        dir.children.forEach((child) => visit(child, dir, ''));
+      };
+      visit(root, null, '');
+      if (firstLoad) seedAll(tree);
+      return tree;
+    });
+}
+
+const reachOf = (tree) => Math.max(...tree.dirs.map((dir) => Math.hypot(dir.x - tree.root.x, dir.y - tree.root.y) + dir.radius));
+const moveTree = (tree, dx, dy) => tree.dirs.forEach((dir) => Object.assign(dir, { x: dir.x + dx, y: dir.y + dy }));
+
+// First load only: trees go on a grid in the order their repos appeared, each cell sized to its tree.
+function arrangeTrees() {
+  const columns = Math.ceil(Math.sqrt(trees.length * 1.8));
+  const sized = trees.map((tree) => ({ tree, reach: reachOf(tree) }));
+  const rows = sized.reduce((list, entry, index) => {
+    if (index % columns === 0) list.push([]);
+    list.at(-1).push(entry);
+    return list;
+  }, []);
+  let top = 0;
+  rows.forEach((row) => {
+    const tallest = Math.max(...row.map((entry) => entry.reach));
+    let left = 0;
+    row.forEach(({ tree, reach }) => {
+      moveTree(tree, left + reach - tree.root.x, top + tallest - tree.root.y);
+      left += reach * 2 + TREE_GAP;
+    });
+    top += tallest * 2 + TREE_GAP;
+  });
+}
+
+// After that a tree only moves when a neighbour grows into it, and only the later repo's tree gives way.
+function separateTrees() {
+  const sized = trees.map((tree) => ({ tree, reach: reachOf(tree) }));
+  let furthest = 0;
+  sized.forEach((first, firstIndex) => sized.forEach((second, secondIndex) => {
+    if (secondIndex <= firstIndex) return;
+    const dx = second.tree.root.x - first.tree.root.x || 0.01;
+    const dy = second.tree.root.y - first.tree.root.y;
+    const distance = Math.hypot(dx, dy);
+    const overlap = first.reach + second.reach + TREE_GAP - distance;
+    if (overlap <= 0) return;
+    const step = Math.min(overlap, 4 + overlap * 0.15);
+    moveTree(second.tree, (dx / distance) * step, (dy / distance) * step);
+    furthest = Math.max(furthest, step);
+  }));
+  return furthest;
 }
 
 function relax() {
-  shown.forEach((first, firstIndex) => shown.forEach((second, secondIndex) => {
+  trees.forEach(({ dirs: members }) => members.forEach((first, firstIndex) => members.forEach((second, secondIndex) => {
     if (secondIndex <= firstIndex) return;
     const dx = second.x - first.x || 0.01;
     const dy = second.y - first.y || 0.01;
@@ -380,7 +485,7 @@ function relax() {
     first.vy -= (dy / distance) * push;
     second.vx += (dx / distance) * push;
     second.vy += (dy / distance) * push;
-  }));
+  })));
 
   // Each pull on a folder is matched on its parent: unequal pulls leave a net torque and the whole tree turns forever.
   shown.forEach((dir) => {
@@ -398,7 +503,7 @@ function relax() {
 
   shown.forEach((dir) => {
     if (!dir.layoutParent) {
-      Object.assign(dir, { x: 0, y: 0, vx: 0, vy: 0 });
+      Object.assign(dir, { vx: 0, vy: 0 });
       return;
     }
     dir.vx = Math.abs(dir.vx) < 0.02 ? 0 : clamp(dir.vx * 0.72, -14, 14);
@@ -406,12 +511,12 @@ function relax() {
     dir.x += dir.vx;
     dir.y += dir.vy;
   });
-  return Math.max(0, ...shown.map((dir) => Math.hypot(dir.vx, dir.vy)));
+  return Math.max(separateTrees(), ...shown.map((dir) => Math.hypot(dir.vx, dir.vy)));
 }
 
 function fire(zap, time) {
   zap.start = time;
-  const node = nodes.get(zap.path);
+  const node = nodes.get(zap.key);
   if (!node) return;
   node.flashAt = time;
   if (node.bornAt === Infinity) node.bornAt = time;
@@ -427,7 +532,7 @@ function follow(time, elapsed) {
     const queued = mine.filter((zap) => zap.start === null);
     const firing = mine.find((zap) => zap.start !== null && time - zap.start < zap.boltMs);
     const next = firing && queued.length <= QUEUE_LIMIT ? null : queued[0];
-    const node = nodes.get((next ?? firing)?.path) ?? agent.node;
+    const node = nodes.get((next ?? firing)?.key) ?? agent.node;
     if (!node) {
       if (next) fire(next, time);
       return;
@@ -435,12 +540,20 @@ function follow(time, elapsed) {
     const angle = angleOf(agent.id);
     const spotX = node.x + (Math.cos(angle) * STAND_OFF) / view.k;
     const spotY = node.y + (Math.sin(angle) * STAND_OFF) / view.k;
+    if (!agent.placed) {
+      const start = next ? ((node.dir ? node : node.parent).tree?.root ?? node) : { x: spotX, y: spotY };
+      Object.assign(agent, { x: start.x, y: start.y, placed: true });
+    }
     const ease = 1 - Math.exp(-elapsed / (next ? TRAVEL_EASE_MS : DRIFT_EASE_MS));
     agent.x += (spotX - agent.x) * ease;
     agent.y += (spotY - agent.y) * ease;
+    const arrived = Math.hypot(spotX - agent.x, spotY - agent.y) < 22 / view.k;
+    const moving = Boolean(next || firing);
+    if (agent.moving && !moving) agent.restedAt = Date.now();
+    agent.moving = moving;
     if (!next) return;
     next.setOffAt ??= time;
-    if (Math.hypot(spotX - agent.x, spotY - agent.y) < 22 / view.k) next.arrivedAt ??= time;
+    if (arrived) next.arrivedAt ??= time;
     const charged = time - next.arrivedAt > CHARGE_MS;
     if (charged || time - next.setOffAt > TRAVEL_MS || queued.length > QUEUE_LIMIT) fire(next, time);
   });
@@ -448,11 +561,12 @@ function follow(time, elapsed) {
 
 function agentPoint(agent, time) {
   const point = toScreen(agent);
+  if (agent.status === 'done') return point;
   const phase = angleOf(agent.id);
   return { x: point.x + Math.cos(time / 1100 + phase) * 4, y: point.y + Math.sin(time / 800 + phase) * 5 };
 }
 
-function fitCamera() {
+function fitCamera(ease = 0.06) {
   if (!view.autoFit || !shown.length) return;
   const left = Math.min(...shown.map((dir) => dir.x - dir.radius));
   const right = Math.max(...shown.map((dir) => dir.x + dir.radius));
@@ -460,9 +574,9 @@ function fitCamera() {
   const bottom = Math.max(...shown.map((dir) => dir.y + dir.radius));
   const inset = view.width > 720 ? PANEL_INSET : 0;
   const scale = clamp(Math.min((view.width - inset - 160) / Math.max(right - left, 1), (view.height - 140) / Math.max(bottom - top, 1)), 0.1, 2.2);
-  view.k += (scale - view.k) * 0.06;
-  view.x += ((left + right) / 2 - inset / 2 / view.k - view.x) * 0.06;
-  view.y += ((top + bottom) / 2 - view.y) * 0.06;
+  view.k += (scale - view.k) * ease;
+  view.x += ((left + right) / 2 - inset / 2 / view.k - view.x) * ease;
+  view.y += ((top + bottom) / 2 - view.y) * ease;
 }
 
 function drawGlow(x, y, radius, colour, alpha) {
@@ -519,18 +633,21 @@ function drawBolt(from, to, colour, strength, seed) {
       y: from.y + (to.y - from.y) * along + ((to.x - from.x) / length) * offset,
     };
   });
-  [[14, 0.14, colour], [6, 0.45, colour], [2, 1, '#ffffff']].forEach(([width, alpha, stroke]) => {
+  // The glow adds light; the core is painted plainly so the bolt keeps the action's exact colour instead of burning out to white.
+  [[14, 0.1, 'lighter'], [6, 0.3, 'lighter'], [2.4, 1, 'source-over']].forEach(([width, alpha, blend]) => {
+    context.globalCompositeOperation = blend;
     context.globalAlpha = alpha * strength;
-    context.strokeStyle = stroke;
+    context.strokeStyle = colour;
     context.lineWidth = width;
     context.beginPath();
     points.forEach((point, index) => (index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y)));
     context.stroke();
   });
+  context.globalCompositeOperation = 'lighter';
 }
 
 function drawZap(zap, time, focus) {
-  const node = nodes.get(zap.path);
+  const node = nodes.get(zap.key);
   const agent = agents.get(zap.agent);
   if (!node || node.hidden || (focus && sessionOf(agent) !== focus)) return;
   const age = time - zap.start;
@@ -538,7 +655,6 @@ function drawZap(zap, time, focus) {
   const colour = theme[zap.kind];
   const point = toScreen(node);
 
-  const branch = node.dir ? node : node.parent;
   const trace = (dir) => {
     if (!dir.layoutParent) return;
     const from = toScreen(dir);
@@ -551,13 +667,11 @@ function drawZap(zap, time, focus) {
   context.strokeStyle = colour;
   context.lineWidth = 2;
   context.beginPath();
-  trace(branch);
+  trace(node.dir ? node : node.parent);
   context.stroke();
 
   if (age < zap.boltMs) drawBolt(agentPoint(agent, time), point, colour, Math.min(1, (zap.boltMs - age) / 260), zap.seed + Math.floor(age / 55));
-
   drawGlow(point.x, point.y, 30, colour, fade ** 2 * 0.9);
-  if (age < 140) drawGlow(point.x, point.y, 14, '#ffffff', 1 - age / 140);
 
   const burst = Math.floor(age / SPARK_MS);
   if (burst * SPARK_MS > zap.boltMs) return;
@@ -647,7 +761,7 @@ function draw(time) {
     const flash = clamp(1 - (time - file.flashAt) / ZAP_MS, 0, 1);
     context.globalAlpha = visible(file) ? 1 - 0.6 * Math.min((now - file.lastTs) / fadeSpan, 1) : 0.08;
     drawMark(point.x, point.y, file.state, 3.4 * dotScale * pop * (1 + flash * 0.8));
-    if (!overlapPaths.has(file.path)) return;
+    if (!overlapKeys.has(file.key)) return;
     context.globalAlpha = 1;
     context.setLineDash([3, 3]);
     context.strokeStyle = theme.ink;
@@ -664,15 +778,16 @@ function draw(time) {
   context.globalCompositeOperation = 'source-over';
   context.globalAlpha = 1;
 
-  const liveAgents = [...agents.values()]
-    .filter((agent) => agent.node && now - agent.lastTs < LIVE_MS && (!focus || sessionOf(agent) === focus))
-    .sort((first, second) => second.lastTs - first.lastTs);
-  liveAgents.forEach((agent) => {
+  const parked = [...agents.values()]
+    .filter((agent) => agent.node && isPresent(agent, now) && (!focus || sessionOf(agent) === focus))
+    .sort((first, second) => (second.status === 'done') - (first.status === 'done') || first.lastTs - second.lastTs);
+  parked.forEach((agent) => {
     const point = agentPoint(agent, time);
     const target = toScreen(agent.node);
-    const size = agent.parent ? 3.2 : 4.6;
+    const size = agent.parent ? 3.4 : 4.8;
+    const colour = agentColour(agent, now);
     context.globalAlpha = 0.25;
-    context.strokeStyle = theme.ink;
+    context.strokeStyle = colour;
     context.lineWidth = 1;
     context.setLineDash([2, 4]);
     context.beginPath();
@@ -681,31 +796,45 @@ function draw(time) {
     context.stroke();
     context.setLineDash([]);
     context.globalCompositeOperation = 'lighter';
-    drawGlow(point.x, point.y, size * 4.5, theme.ink, 0.35 + 0.1 * Math.sin(time / 380 + angleOf(agent.id)));
+    drawGlow(point.x, point.y, size * 4.5, colour, agent.status === 'done' ? 0.3 : 0.4 + 0.12 * Math.sin(time / 380 + angleOf(agent.id)));
     context.globalCompositeOperation = 'source-over';
     context.globalAlpha = 1;
-    context.fillStyle = theme.ink;
+    context.fillStyle = colour;
+    context.strokeStyle = theme.page;
+    context.lineWidth = 1.5;
     context.beginPath();
     context.arc(point.x, point.y, size, 0, TAU);
     context.fill();
+    context.stroke();
   });
-  liveAgents.forEach((agent) => {
+  [...parked].reverse().forEach((agent) => {
     const point = agentPoint(agent, time);
-    const text = agentLabel(agent);
-    drawLabel(text.length > 30 ? `${text.slice(0, 29)}…` : text, point.x + 10, point.y, theme.ink, placed);
+    const name = agentLabel(agent);
+    const short = name.length > 30 ? `${name.slice(0, 29)}…` : name;
+    const state = agentState(agent, now);
+    drawLabel(state === 'working' || state === 'moving' ? short : `${short} · ${state}`, point.x + 10, point.y, theme.ink, placed);
   });
 
+  context.font = ROOT_FONT;
+  trees.forEach(({ root }) => {
+    const point = toScreen(root);
+    const width = context.measureText(root.name).width;
+    drawLabel(root.name, point.x - width / 2, point.y + root.radius * view.k + 12, theme.ink, placed);
+  });
+  context.font = FONT;
+
   files
-    .filter((file) => time >= file.bornAt && visible(file) && (overlapPaths.has(file.path) || file === hoveredNode || now - file.lastTs < HOT_LABEL_MS))
-    .sort((first, second) => overlapPaths.has(second.path) - overlapPaths.has(first.path) || second.lastTs - first.lastTs)
+    .filter((file) => time >= file.bornAt && visible(file) && (overlapKeys.has(file.key) || file === hoveredNode || now - file.lastTs < HOT_LABEL_MS))
+    .sort((first, second) => overlapKeys.has(second.key) - overlapKeys.has(first.key) || second.lastTs - first.lastTs)
     .slice(0, 40)
     .forEach((file) => {
       const point = toScreen(file);
-      const text = overlapPaths.has(file.path) ? `⚠ ${file.name}` : file.name;
+      const text = overlapKeys.has(file.key) ? `⚠ ${file.name}` : file.name;
       drawLabel(text, point.x + 8 * dotScale, point.y, theme.ink2, placed);
     });
 
-  [...shown]
+  shown
+    .filter((dir) => dir.layoutParent)
     .sort((first, second) => second.files.length - first.files.length)
     .forEach((dir) => {
       const point = toScreen(dir);
@@ -734,15 +863,21 @@ function make(tag, className, text) {
   return element;
 }
 
+function statusDot(agent, now) {
+  const dot = make('span', 'dot');
+  dot.style.background = agentColour(agent, now);
+  return dot;
+}
+
 function renderFamily(family, now) {
   const { session, members } = family;
-  const row = make('button', `row${now - family.lastTs > LIVE_MS ? ' idle' : ''}${pinnedSession === session.id ? ' pinned' : ''}`);
+  const row = make('button', `row${pinnedSession === session.id ? ' pinned' : ''}`);
   row.dataset.session = session.id;
   row.title = pinnedSession === session.id ? 'Click to show every agent again' : 'Click to show only this session';
-  row.append(make('span', 'name', agentLabel(session)), make('span', 'ago', ago(family.lastTs)));
+  row.append(statusDot(session, now), make('span', 'name', agentLabel(session)), make('span', 'state', session.lastEvent ? agentState(session, now) : session.status ?? ''));
   const parts = [row];
   if (session.lastEvent) {
-    const { kind, via, path } = session.lastEvent;
+    const { kind, via, path, repo } = session.lastEvent;
     const detail = make('div', 'detail');
     detail.append(make('i', `mark ${kind}`), make('span', '', `‎${via === 'search' ? 'search' : kind} · ${path || repo}‎`));
     parts.push(detail);
@@ -751,12 +886,12 @@ function renderFamily(family, now) {
     .sort((first, second) => second.lastTs - first.lastTs)
     .slice(0, 6)
     .forEach((member) => {
-      const line = make('div', `sub${now - member.lastTs > LIVE_MS ? ' idle' : ''}`);
+      const line = make('div', 'sub');
       const text = member.description ? `${agentLabel(member)} · ${member.description}` : agentLabel(member);
-      line.append(make('span', 'name', `↳ ${text}`), make('span', 'ago', ago(member.lastTs)));
+      line.append(statusDot(member, now), make('span', 'name', text), make('span', 'state', agentState(member, now)));
       parts.push(line);
     });
-  if (members.length > 6) parts.push(make('div', 'sub idle', `↳ ${members.length - 6} more`));
+  if (members.length > 6) parts.push(make('div', 'detail', `${members.length - 6} more`));
   return parts;
 }
 
@@ -764,44 +899,48 @@ function renderPanel() {
   panelDirty = false;
   const now = Date.now();
   const cutoff = cutoffNow();
+  const present = [...agents.values()].filter((agent) => agent.lastEvent && isPresent(agent, now));
   const families = new Map();
-  [...agents.values()]
-    .filter((agent) => agent.lastEvent)
-    .forEach((agent) => {
-      const session = getAgent(sessionOf(agent));
-      const family = families.get(session.id) ?? { session, members: [], lastTs: 0, wt: null };
-      if (agent !== session) family.members.push(agent);
-      if (agent.lastTs > family.lastTs) Object.assign(family, { lastTs: agent.lastTs, wt: agent.lastEvent.wt });
-      families.set(session.id, family);
-    });
+  present.forEach((agent) => {
+    const session = getAgent(sessionOf(agent));
+    const family = families.get(session.id) ?? { session, members: [], lastTs: 0, place: null };
+    if (agent !== session) family.members.push(agent);
+    if (agent.lastTs > family.lastTs) Object.assign(family, { lastTs: agent.lastTs, place: agent.lastEvent });
+    families.set(session.id, family);
+  });
 
   const groups = new Map();
   [...families.values()]
     .sort((first, second) => second.lastTs - first.lastTs)
-    .forEach((family) => groups.set(family.wt, [...(groups.get(family.wt) ?? []), family]));
+    .forEach((family) => {
+      const group = keyOf(family.place.repo, family.place.wt);
+      groups.set(group, [...(groups.get(group) ?? []), family]);
+    });
 
-  const agentRows = [...groups].flatMap(([name, group]) => {
-    const heading = make('h2', '', name);
-    const branch = worktrees.get(name)?.branch;
-    heading.append(make('small', '', branch && branch !== name ? branch : worktrees.has(name) ? '' : 'removed worktree'));
+  const agentRows = [...groups.values()].flatMap((group) => {
+    const { repo, wt } = group[0].place;
+    const worktree = repos.get(repo)?.get(wt);
+    const heading = make('h2', '', repo);
+    heading.append(make('small', '', worktree ? (worktree.primary ? worktree.branch : `${wt} · ${worktree.branch}`) : `${wt} · removed worktree`));
     return [heading, ...group.flatMap((family) => renderFamily(family, now))];
   });
   elements.agents.replaceChildren(...agentRows);
 
   const overlaps = files.filter((file) => [...file.writers.values()].filter((ts) => ts >= cutoff).length > 1);
-  overlapPaths = new Set(overlaps.map((file) => file.path));
+  overlapKeys = new Set(overlaps.map((file) => file.key));
   const overlapRows = overlaps.map((file) => {
     const row = make('button', 'overlap');
-    row.dataset.path = file.path;
-    row.append(make('b', '', `⚠ ${file.path}`), make('span', '', [...file.writers.keys()].join(' · ')));
+    row.dataset.key = file.key;
+    row.append(make('b', '', `⚠ ${file.repo}/${file.path}`), make('span', '', [...file.writers.keys()].join(' · ')));
     return row;
   });
   elements.overlaps.replaceChildren(...(overlaps.length ? [make('h2', '', 'Changed in two worktrees'), ...overlapRows] : []));
 
-  const active = [...agents.values()].filter((agent) => agent.lastEvent && now - agent.lastTs < LIVE_MS).length;
-  elements.summary.textContent = `${active} active · ${files.length} file${files.length === 1 ? '' : 's'} · ${overlaps.length} overlap${overlaps.length === 1 ? '' : 's'}`;
-  elements.empty.hidden = files.length > 0 || dirs.length > 1;
-  if (active) wake();
+  const finished = present.filter((agent) => agent.status === 'done').length;
+  const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
+  elements.summary.textContent = `${present.length - finished} working · ${finished} done · ${plural(trees.length, 'repo')} · ${plural(files.length, 'file')} · ${plural(overlaps.length, 'overlap')}`;
+  elements.empty.hidden = dirs.length > 0;
+  if (present.length > finished) wake();
 }
 
 function showTooltip(node, x, y) {
@@ -816,7 +955,7 @@ function showTooltip(node, x, y) {
       row.append(make('span', '', `${name}: ${counts}`), make('em', '', ago(touch.ts)));
       return row;
     });
-  elements.tooltip.replaceChildren(make('b', '', node.path || repo), ...rows);
+  elements.tooltip.replaceChildren(make('b', '', node.path ? `${node.repo}/${node.path}` : node.repo), ...rows);
   elements.tooltip.hidden = false;
   const bounds = elements.tooltip.getBoundingClientRect();
   elements.tooltip.style.left = `${clamp(x + 14, 8, view.width - bounds.width - 8)}px`;
@@ -844,15 +983,24 @@ function resize() {
   wake();
 }
 
+function setRepos(list) {
+  repos = new Map(list.map(({ name, worktrees }) => [name, new Map(worktrees.map((worktree) => [worktree.name, worktree]))]));
+  panelDirty = true;
+}
+
 const handlers = {
   init(message) {
-    repo = message.repo;
-    elements.repo.textContent = repo;
-    worktrees = new Map(message.worktrees.map((worktree) => [worktree.name, worktree]));
+    if (!message.repos) {
+      elements.empty.textContent = 'This server is older than the page. Stop it and start it again.';
+      return;
+    }
+    lookbackMs = message.minutes * 60_000;
+    setRepos(message.repos);
     agents = new Map();
     message.agents.forEach((agent) => Object.assign(getAgent(agent.id), agent));
     log = message.events;
     nodes = new Map();
+    zaps = [];
     rebuild();
   },
   event(message) {
@@ -864,10 +1012,10 @@ const handlers = {
   agent(message) {
     Object.assign(getAgent(message.agent.id), message.agent);
     panelDirty = true;
+    wake();
   },
-  worktrees(message) {
-    worktrees = new Map(message.worktrees.map((worktree) => [worktree.name, worktree]));
-    panelDirty = true;
+  repos(message) {
+    setRepos(message.repos);
   },
 };
 
@@ -922,7 +1070,7 @@ elements.agents.addEventListener('click', (event) => {
   wake();
 });
 elements.overlaps.addEventListener('click', (event) => {
-  const node = nodes.get(event.target.closest('[data-path]')?.dataset.path);
+  const node = nodes.get(event.target.closest('[data-key]')?.dataset.key);
   if (!node) return;
   Object.assign(view, { autoFit: false, x: node.x, y: node.y, k: 1.6 });
   wake();
@@ -950,7 +1098,6 @@ if ([...elements.trail.options].some((option) => option.value === requestedTrail
 }
 
 resize();
-ensureNode('', true);
 requestAnimationFrame(frame);
 setInterval(expire, 5000);
 setInterval(() => { if (panelDirty) renderPanel(); }, 250);

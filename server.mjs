@@ -1,17 +1,19 @@
 #!/usr/bin/env node
+// Tails Claude Code transcripts and streams which files each agent touches, grouped by git repo.
+// usage: server.mjs [--repo <dir> ...] [--port 4777] [--minutes 60]
+// With no --repo it shows every repo an agent worked in during the lookback window.
 import { execFileSync } from 'node:child_process';
 import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { homedir } from 'node:os';
-import { basename, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { listWorktrees, portFor } from './repo.mjs';
 
 const { values: options } = parseArgs({
   options: {
-    repo: { type: 'string', default: process.cwd() },
-    port: { type: 'string' },
+    repo: { type: 'string', multiple: true, default: [] },
+    port: { type: 'string', default: '4777' },
     minutes: { type: 'string', default: '60' },
   },
 });
@@ -30,18 +32,23 @@ const LIVE_MS = 15_000;
 const SHELL_RECHECK_DELAYS_MS = [5000, 30_000];
 const SHELL_CHANGE_WINDOW_MS = 30_000;
 
-let worktrees = [];
+let roots = [];
 let events = [];
+const repos = new Map();
+const outsideAnyRepo = new Set();
 const agents = new Map();
 const tracked = new Map();
 const clients = new Set();
 const touched = new Set();
 const ignoredByPath = new Map();
 const pendingFileCalls = new Map();
+const workedFrom = new Set();
 
-const encodeProjectName = (path) => path.replace(/[^a-zA-Z0-9]/g, '-');
-const publicAgent = ({ id, parent, title, agentType, description }) => ({ id, parent, title, agentType, description });
-const publicWorktrees = () => worktrees.map(({ name, branch, primary }) => ({ name, branch, primary }));
+const publicAgent = ({ id, parent, title, agentType, description, status, statusAt }) => ({ id, parent, title, agentType, description, status, statusAt });
+const publicRepos = () =>
+  [...repos.values()]
+    .filter((repo) => repo.shown)
+    .map(({ name, worktrees }) => ({ name, worktrees: worktrees.map(({ name: worktree, branch, primary }) => ({ name: worktree, branch, primary })) }));
 
 function parse(line) {
   try {
@@ -60,27 +67,6 @@ function gitSucceeds(root, ...args) {
   }
 }
 
-function ignoredAmong(paths) {
-  try {
-    return execFileSync('git', ['-C', worktrees[0].root, 'check-ignore', '--', ...paths], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
-      .split('\n')
-      .filter(Boolean);
-  } catch {
-    return [];
-  }
-}
-
-function isIgnored(path) {
-  if (path === '.git' || path.startsWith('.git/')) return true;
-  const chain = path.split('/').map((_, index, parts) => parts.slice(0, index + 1).join('/'));
-  const unknown = chain.filter((ancestor) => !ignoredByPath.has(ancestor));
-  if (unknown.length) {
-    const ignored = new Set(ignoredAmong(unknown));
-    unknown.forEach((ancestor) => ignoredByPath.set(ancestor, ignored.has(ancestor)));
-  }
-  return chain.some((ancestor) => ignoredByPath.get(ancestor));
-}
-
 function broadcast(message) {
   const frame = `data: ${JSON.stringify(message)}\n\n`;
   clients.forEach((client) => client.write(frame));
@@ -88,35 +74,138 @@ function broadcast(message) {
 
 function emit(event) {
   events.push(event);
-  touched.add(`${event.wt}\n${event.path}`);
+  touched.add(`${event.repo}\n${event.wt}\n${event.path}`);
   broadcast({ type: 'event', event });
 }
 
-function refreshWorktrees() {
-  const next = listWorktrees(options.repo);
-  const changed = JSON.stringify(next) !== JSON.stringify(worktrees);
-  worktrees = next;
-  if (changed) broadcast({ type: 'worktrees', worktrees: publicWorktrees() });
+// The first entry is the primary checkout, whichever worktree or subfolder the command runs from.
+function listWorktrees(directory) {
+  return execFileSync('git', ['-C', directory, 'worktree', 'list', '--porcelain'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+    .trim()
+    .split('\n\n')
+    .map((block, index) => {
+      const root = /^worktree (.+)$/m.exec(block)?.[1];
+      const branch = /^branch refs\/heads\/(.+)$/m.exec(block)?.[1] ?? 'detached';
+      return root && { root, name: basename(root), branch, primary: index === 0 };
+    })
+    .filter(Boolean);
 }
 
-function locate(absolutePath) {
-  const [match] = worktrees
-    .filter(({ root }) => absolutePath === root || absolutePath.startsWith(`${root}/`))
+const onlyRepos = new Set(
+  options.repo.map((directory) => {
+    try {
+      return listWorktrees(directory)[0].root;
+    } catch {
+      console.error(`Not a git repository: ${directory}`);
+      return process.exit(1);
+    }
+  }),
+);
+
+function register(worktrees) {
+  const [primary] = worktrees;
+  const nameTaken = [...repos.values()].some((repo) => repo.name === basename(primary.root));
+  const repo = repos.get(primary.root) ?? {
+    root: primary.root,
+    name: nameTaken ? `${basename(dirname(primary.root))}/${basename(primary.root)}` : basename(primary.root),
+    shown: onlyRepos.has(primary.root),
+  };
+  const changed = JSON.stringify(repo.worktrees) !== JSON.stringify(worktrees);
+  repo.worktrees = worktrees;
+  repos.set(repo.root, repo);
+  if (!changed) return;
+  roots = [...repos.values()]
+    .flatMap((entry) => entry.worktrees.map((worktree) => ({ ...worktree, repo: entry })))
     .sort((first, second) => second.root.length - first.root.length);
-  if (!match) return null;
-  const path = absolutePath.slice(match.root.length + 1);
+  broadcast({ type: 'repos', repos: publicRepos() });
+}
+
+// A repo appears once an agent runs from inside it or uses a file tool on it. A path merely named in a
+// shell command is not enough: every PATH export would otherwise put the Homebrew checkout on screen.
+function reveal(repo) {
+  if (onlyRepos.size || repo.shown) return;
+  repo.shown = true;
+  broadcast({ type: 'repos', repos: publicRepos() });
+}
+
+function refreshWorktrees() {
+  repos.forEach((repo) => {
+    try {
+      register(listWorktrees(repo.root));
+    } catch {
+      // the checkout was deleted: keep what is known so its old events still resolve
+    }
+  });
+}
+
+const rootOf = (absolutePath) => roots.find(({ root }) => absolutePath === root || absolutePath.startsWith(`${root}/`));
+
+function existingDirectory(path) {
+  if (statSync(path, { throwIfNoEntry: false })?.isDirectory()) return path;
+  const parent = dirname(path);
+  return parent === path ? null : existingDirectory(parent);
+}
+
+function discover(absolutePath) {
+  const directory = existingDirectory(absolutePath);
+  if (!directory || outsideAnyRepo.has(directory)) return null;
+  try {
+    register(listWorktrees(directory));
+  } catch {
+    outsideAnyRepo.add(directory);
+    return null;
+  }
+  const found = rootOf(absolutePath);
+  if (!found) outsideAnyRepo.add(directory);
+  return found;
+}
+
+function revealWorkedFrom(cwd) {
+  if (!cwd || workedFrom.has(cwd)) return;
+  workedFrom.add(cwd);
+  const found = rootOf(cwd) ?? discover(cwd);
+  if (found) reveal(found.repo);
+}
+
+function locate(absolutePath, usedFileTool) {
+  const found = rootOf(absolutePath) ?? discover(absolutePath);
+  if (found && usedFileTool) reveal(found.repo);
+  if (!found?.repo.shown) return null;
+  const path = absolutePath.slice(found.root.length + 1);
   // A worktree git no longer lists still has transcripts; without this its files nest under the primary checkout.
-  const removed = REMOVED_WORKTREE.exec(path);
+  const removed = found.primary && REMOVED_WORKTREE.exec(path);
   return removed
-    ? { wt: removed[1], path: removed[2] ?? '', root: join(match.root, '.claude', 'worktrees', removed[1]) }
-    : { wt: match.name, path, root: match.root };
+    ? { repo: found.repo, wt: removed[1], path: removed[2] ?? '', root: join(found.root, '.claude', 'worktrees', removed[1]) }
+    : { repo: found.repo, wt: found.name, path, root: found.root };
+}
+
+function ignoredAmong(root, paths) {
+  try {
+    return execFileSync('git', ['-C', root, 'check-ignore', '--', ...paths], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+      .split('\n')
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function isIgnored({ repo, path }) {
+  if (path === '.git' || path.startsWith('.git/')) return true;
+  const cacheKey = (ancestor) => `${repo.root}\n${ancestor}`;
+  const chain = path.split('/').map((_, index, parts) => parts.slice(0, index + 1).join('/'));
+  const unknown = chain.filter((ancestor) => !ignoredByPath.has(cacheKey(ancestor)));
+  if (unknown.length) {
+    const ignored = new Set(ignoredAmong(repo.root, unknown));
+    unknown.forEach((ancestor) => ignoredByPath.set(cacheKey(ancestor), ignored.has(ancestor)));
+  }
+  return chain.some((ancestor) => ignoredByPath.get(cacheKey(ancestor)));
 }
 
 function shellTouches(command, cwd) {
   const changedTo = /^\s*cd\s+["']?([^"'\s;&]+)/.exec(command)?.[1];
   const base = changedTo ? resolve(cwd, changedTo) : cwd;
   const unquote = (word) => word.replace(/^["'`]+|["'`]+$/g, '');
-  const plain = (token) => token.length > 2 && token.length < 260 && !token.startsWith('-') && !/[*?$\\{}~]/.test(token);
+  const plain = (token) => token.length > 2 && token.length < 260 && !token.startsWith('-') && !/[*?$\\{}~<>&|]/.test(token);
   const removed = new Set(
     command.split(/&&|\|\||[;|\n]/).flatMap((segment) => {
       const words = segment.trim().split(/\s+/).map(unquote);
@@ -147,7 +236,7 @@ function shellKind(stats, deleting, ts, place) {
   if (!changed) return 'read';
   const existedBefore =
     stats.birthtimeMs < ts - 1000 ||
-    touched.has(`${place.wt}\n${place.path}`) ||
+    touched.has(`${place.repo.name}\n${place.wt}\n${place.path}`) ||
     gitSucceeds(place.root, 'ls-files', '--error-unmatch', '--', place.path);
   return existedBefore ? 'modify' : 'write';
 }
@@ -155,14 +244,14 @@ function shellKind(stats, deleting, ts, place) {
 function toEvent({ via, kind, target, deleting, lines }, cwd, ts, agent) {
   if (typeof target !== 'string') return null;
   const absolutePath = resolve(cwd, target);
-  const place = locate(absolutePath);
+  const place = locate(absolutePath, via === 'tool');
   if (!place || (!place.path && via !== 'search')) return null;
   const stats = via === 'tool' ? null : statSync(absolutePath, { throwIfNoEntry: false });
   const resolvedKind = via === 'shell' ? shellKind(stats, deleting, ts, place) : kind;
-  if (!resolvedKind || (place.path && isIgnored(place.path))) return null;
+  if (!resolvedKind || (place.path && isIgnored(place))) return null;
   const dir = via === 'tool' ? false : (stats?.isDirectory() ?? !/\.[a-z0-9]+$/i.test(absolutePath));
   const size = lines ?? (stats?.isFile() ? Math.ceil(stats.size / BYTES_PER_LINE) : undefined);
-  return { ts, agent: agent.id, kind: resolvedKind, via, path: place.path, dir, wt: place.wt, lines: size };
+  return { ts, agent: agent.id, kind: resolvedKind, via, repo: place.repo.name, path: place.path, dir, wt: place.wt, lines: size };
 }
 
 const eventsOf = (block, cwd, ts, agent) =>
@@ -208,20 +297,33 @@ function ingestFileResult(block, result, cwd, ts, agent) {
   if (event) emit(event);
 }
 
-function ingestActivity(line, agent) {
-  const record = parse(line);
-  const ts = Date.parse(record?.timestamp);
+function ingestActivity(record, ts, agent) {
   if (!(ts >= Date.now() - LOOKBACK_MS)) return;
-  const cwd = record.cwd ?? options.repo;
-  if (record.type === 'assistant' && Array.isArray(record.message?.content)) {
-    record.message.content
-      .filter((block) => block?.type === 'tool_use')
-      .forEach((block) => ingestBlock(block, cwd, ts, agent));
-  } else if (record.toolUseResult && Array.isArray(record.message?.content)) {
-    record.message.content
+  const cwd = record.cwd ?? homedir();
+  const blocks = Array.isArray(record.message?.content) ? record.message.content : [];
+  if (record.type === 'assistant') {
+    blocks.filter((block) => block?.type === 'tool_use').forEach((block) => ingestBlock(block, cwd, ts, agent));
+  } else if (record.toolUseResult) {
+    blocks
       .filter((block) => block?.type === 'tool_result' && pendingFileCalls.has(block.tool_use_id))
       .forEach((block) => ingestFileResult(block, record.toolUseResult, cwd, ts, agent));
   }
+}
+
+// e.g. an assistant line with stop_reason "end_turn" -> done; a prompt or a tool result -> working
+function turnStatus(record) {
+  if (record.type === 'assistant') return record.message?.stop_reason === 'end_turn' ? 'done' : 'working';
+  if (record.type !== 'user' || record.isMeta) return null;
+  if (record.toolUseResult) return 'working';
+  const text = JSON.stringify(record.message?.content ?? '');
+  if (text.includes('[Request interrupted by user')) return 'done';
+  return /<local-command-|<command-name>/.test(text) ? null : 'working';
+}
+
+function setStatus(agent, status, statusAt) {
+  if (!status || agent.status === status) return;
+  Object.assign(agent, { status, statusAt });
+  broadcast({ type: 'agent', agent: publicAgent(agent) });
 }
 
 function ingestTitle(line, agent) {
@@ -235,17 +337,30 @@ function ingestTitle(line, agent) {
 }
 
 function ingest(line, agent) {
-  if (line.includes('"tool_use"') || line.includes('"toolUseResult"')) ingestActivity(line, agent);
-  else if (!agent.parent && line.length < 2000 && (line.includes('-title"') || line.includes('"agent-name"'))) ingestTitle(line, agent);
+  const activity = line.includes('"tool_use"') || line.includes('"toolUseResult"');
+  if (activity || line.includes('"stop_reason":"end_turn"') || line.includes('"type":"user"')) {
+    const record = parse(line);
+    const ts = Date.parse(record?.timestamp);
+    if (!ts) return;
+    revealWorkedFrom(record.cwd);
+    // A subagent's transcript often stops mid-turn, so its meta file decides when it is done.
+    if (!agent.parent) setStatus(agent, turnStatus(record), ts);
+    if (activity) ingestActivity(record, ts, agent);
+  } else if (!agent.parent && line.length < 2000 && (line.includes('-title"') || line.includes('"agent-name"'))) {
+    ingestTitle(line, agent);
+  }
 }
 
-function loadMeta(state) {
-  if (!state.meta || state.agent.agentType || !existsSync(state.meta)) return;
-  const meta = parse(readFileSync(state.meta, 'utf8'));
-  if (!meta) return;
-  state.agent.agentType = meta.agentType ?? 'subagent';
-  state.agent.description = meta.description ?? null;
-  broadcast({ type: 'agent', agent: publicAgent(state.agent) });
+function loadMeta({ meta, agent }) {
+  if (!meta || agent.status === 'done') return;
+  const stats = statSync(meta, { throwIfNoEntry: false });
+  const details = stats && parse(readFileSync(meta, 'utf8'));
+  if (!details) return;
+  if (!agent.agentType) {
+    Object.assign(agent, { agentType: details.agentType ?? 'subagent', description: details.description ?? null });
+    broadcast({ type: 'agent', agent: publicAgent(agent) });
+  }
+  setStatus(agent, details.finished ? 'done' : 'working', stats.mtimeMs);
 }
 
 function drain(state, file) {
@@ -271,7 +386,7 @@ function track(file) {
   if (tracked.has(file)) return;
   const [project, session, ...nested] = relative(PROJECTS_DIR, file).split(sep);
   const isSubagent = nested.length > 0;
-  const agent = { id: basename(file, '.jsonl'), parent: isSubagent ? session : null, title: null, agentType: null, description: null };
+  const agent = { id: basename(file, '.jsonl'), parent: isSubagent ? session : null, title: null, agentType: null, description: null, status: null, statusAt: 0 };
   agents.set(agent.id, agent);
   tracked.set(file, { offset: 0, agent, meta: isSubagent ? file.replace(/\.jsonl$/, '.meta.json') : null });
   broadcast({ type: 'agent', agent: publicAgent(agent) });
@@ -281,10 +396,9 @@ function track(file) {
 
 function scan() {
   const cutoff = Date.now() - LOOKBACK_MS;
-  const prefixes = worktrees.map(({ root }) => encodeProjectName(root));
-  readdirSync(PROJECTS_DIR)
-    .filter((project) => prefixes.some((prefix) => project.startsWith(prefix)))
-    .forEach((project) => {
+  readdirSync(PROJECTS_DIR, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .forEach(({ name: project }) => {
       readdirSync(join(PROJECTS_DIR, project), { recursive: true })
         .filter((entry) => entry.endsWith('.jsonl'))
         .map((entry) => join(PROJECTS_DIR, project, entry))
@@ -296,13 +410,6 @@ function scan() {
 
 const drainAll = () => tracked.forEach(drain);
 
-try {
-  refreshWorktrees();
-} catch {
-  console.error(`Not a git repository: ${options.repo}`);
-  process.exit(1);
-}
-const port = Number(options.port ?? portFor(worktrees[0].root));
 scan();
 drainAll();
 events.sort((first, second) => first.ts - second.ts);
@@ -321,15 +428,15 @@ createServer((request, response) => {
   response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
   const init = {
     type: 'init',
-    repo: worktrees[0].name,
-    worktrees: publicWorktrees(),
+    minutes: Number(options.minutes),
+    repos: publicRepos(),
     agents: [...agents.values()].map(publicAgent),
     events,
   };
   response.write(`data: ${JSON.stringify(init)}\n\n`);
   clients.add(response);
   request.on('close', () => clients.delete(response));
-}).listen(port, '127.0.0.1', () => {
-  console.log(`Agent visualizer for ${worktrees[0].root}`);
-  console.log(`http://127.0.0.1:${port}`);
+}).listen(Number(options.port), '127.0.0.1', () => {
+  console.log(`Agent visualizer: http://127.0.0.1:${options.port}`);
+  console.log(`Watching ${publicRepos().map((repo) => repo.name).join(', ') || 'for agent activity'}`);
 });
