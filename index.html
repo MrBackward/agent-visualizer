@@ -613,7 +613,7 @@ function fitCamera(ease = 0.06) {
   const top = Math.min(...shown.map((dir) => dir.y - dir.radius));
   const bottom = Math.max(...shown.map((dir) => dir.y + dir.radius));
   const inset = view.width > 720 ? PANEL_INSET : 0;
-  const scale = clamp(Math.min((view.width - inset - 160) / Math.max(right - left, 1), (view.height - 140 - BOX_RESERVE) / Math.max(bottom - top, 1)), 0.1, 2.2);
+  const scale = clamp(Math.min((view.width - inset - 340) / Math.max(right - left, 1), (view.height - 140 - BOX_RESERVE) / Math.max(bottom - top, 1)), 0.1, 3);
   view.k += (scale - view.k) * ease;
   view.x += ((left + right) / 2 - inset / 2 / view.k - view.x) * ease;
   view.y += ((top + bottom) / 2 - BOX_RESERVE / 2 / view.k - view.y) * ease;
