@@ -27,6 +27,18 @@ const SHELL_TOOLS = new Set(['Bash', 'Monitor']);
 const DELETE_COMMANDS = new Set(['rm', 'unlink', 'rmdir']);
 const TITLE_TYPES = new Set(['custom-title', 'agent-name', 'ai-title']);
 const BYTES_PER_LINE = 40;
+const CHECK_TOOLS = new Set([
+  'jest', 'vitest', 'mocha', 'ava', 'karma', 'playwright', 'cypress', 'rspec', 'minitest', 'pytest', 'tox', 'nox', 'phpunit',
+  'eslint', 'oxlint', 'stylelint', 'rubocop', 'brakeman', 'ruff', 'biome', 'shellcheck', 'markdownlint',
+  'tsc', 'mypy', 'pyright', 'typecheck', 'agent-browser',
+]);
+const CHECK_SCRIPTS = /^(tests?|check|lint|verify|validate|typecheck|type-check|vet|clippy|build|e2e|specs?)([:._-]\S*)?$/;
+const SYNTAX_CHECKS = /\bnode\s+--check\b|\bruby\s+-c\b|\bbash\s+-n\b|\bpython3?\s+-m\s+(pytest|unittest|mypy|py_compile|compileall)\b/;
+const SHELL_KEYWORDS = new Set(['do', 'then', 'else', 'time', 'sudo', 'env', 'command', 'nohup']);
+const NOT_CHECKS = new Set([
+  'git', 'gh', 'echo', 'printf', 'cd', 'cat', 'ls', 'grep', 'rg', 'sed', 'awk', 'find', 'head', 'tail', 'wc', 'sort', 'mkdir', 'rm', 'cp', 'mv',
+  'touch', 'chmod', 'which', 'export', 'kill', 'pkill', 'pgrep', 'lsof', 'curl', 'open', 'for', 'if', 'while', 'test', '[', 'docker', 'brew',
+]);
 const REMOVED_WORKTREE = /^\.claude\/worktrees\/([^/]+)(?:\/(.*))?$/;
 const LIVE_MS = 15_000;
 const SHELL_RECHECK_DELAYS_MS = [5000, 30_000];
@@ -44,7 +56,7 @@ const ignoredByPath = new Map();
 const pendingFileCalls = new Map();
 const workedFrom = new Set();
 
-const publicAgent = ({ id, parent, title, agentType, description, status, statusAt }) => ({ id, parent, title, agentType, description, status, statusAt });
+const publicAgent = ({ id, parent, title, agentType, description, status, statusAt, validating }) => ({ id, parent, title, agentType, description, status, statusAt, validating });
 const publicRepos = () =>
   [...repos.values()]
     .filter((repo) => repo.shown)
@@ -222,6 +234,27 @@ function shellTouches(command, cwd) {
     .map((token) => ({ via: 'shell', target: resolve(base, token), deleting: removed.has(token) }));
 }
 
+// Tests, linters, type checks, builds and browser checks: anything run to confirm the work.
+// e.g. "cd app && bundle exec rubocop lib | tail" -> "bundle exec rubocop"; "git commit -m 'fix test'" -> null
+function validationLabel(command) {
+  const script = command.split('<<')[0].replace(/'[^']*'|"[^"]*"/g, ' ');
+  const labels = script.split(/&&|\|\||[;|\n]/).map((segment) => {
+    const syntaxCheck = SYNTAX_CHECKS.exec(segment)?.[0];
+    if (syntaxCheck) return syntaxCheck.replace(/\s+/g, ' ');
+    const words = segment.trim().split(/\s+/).filter((word) => word && !/^\w+=/.test(word) && !word.startsWith('-'));
+    const names = words.slice(SHELL_KEYWORDS.has(words[0]) ? 1 : 0).slice(0, 5).map((word) => basename(word));
+    if (!names.length || NOT_CHECKS.has(names[0])) return null;
+    const found = names.findIndex((name, index) => CHECK_TOOLS.has(name) || (index > 0 && CHECK_SCRIPTS.test(name)));
+    return found === -1 ? null : names.slice(0, found + 1).join(' ').slice(0, 28);
+  });
+  return labels.find(Boolean) ?? null;
+}
+
+function publishChecks(agent) {
+  agent.validating = [...agent.checks.values()].at(-1) ?? null;
+  broadcast({ type: 'agent', agent: publicAgent(agent) });
+}
+
 function touchesOf({ name, input = {} }, cwd) {
   if (SEARCH_TOOLS.has(name)) return [{ via: 'search', kind: 'read', target: input.path ?? cwd }];
   if (SHELL_TOOLS.has(name)) return shellTouches(input.command ?? '', cwd);
@@ -265,7 +298,13 @@ function ingestBlock(block, cwd, ts, agent) {
     pendingFileCalls.set(block.id, block.input?.file_path ?? block.input?.notebook_path);
     return;
   }
-  const found = eventsOf(block, cwd, ts, agent);
+  const check = SHELL_TOOLS.has(block.name) ? validationLabel(block.input?.command ?? '') : null;
+  if (check) {
+    agent.checks.set(block.id, { label: check, since: ts });
+    publishChecks(agent);
+  }
+  // A check names the files it runs against without the agent working on them, so only real changes are reported.
+  const found = eventsOf(block, cwd, ts, agent).filter((event) => !check || event.kind !== 'read');
   found.forEach(emit);
   if (!SHELL_TOOLS.has(block.name) || Date.now() - ts > LIVE_MS) return;
   const changed = new Set(found.filter((event) => event.kind !== 'read').map((event) => event.path));
@@ -304,6 +343,8 @@ function ingestActivity(record, ts, agent) {
   if (record.type === 'assistant') {
     blocks.filter((block) => block?.type === 'tool_use').forEach((block) => ingestBlock(block, cwd, ts, agent));
   } else if (record.toolUseResult) {
+    const finished = blocks.filter((block) => block?.type === 'tool_result' && agent.checks.delete(block.tool_use_id));
+    if (finished.length) publishChecks(agent);
     blocks
       .filter((block) => block?.type === 'tool_result' && pendingFileCalls.has(block.tool_use_id))
       .forEach((block) => ingestFileResult(block, record.toolUseResult, cwd, ts, agent));
@@ -322,7 +363,8 @@ function turnStatus(record) {
 
 function setStatus(agent, status, statusAt) {
   if (!status || agent.status === status) return;
-  Object.assign(agent, { status, statusAt });
+  if (status === 'done') agent.checks.clear();
+  Object.assign(agent, { status, statusAt, validating: status === 'done' ? null : agent.validating });
   broadcast({ type: 'agent', agent: publicAgent(agent) });
 }
 
@@ -386,7 +428,7 @@ function track(file) {
   if (tracked.has(file)) return;
   const [project, session, ...nested] = relative(PROJECTS_DIR, file).split(sep);
   const isSubagent = nested.length > 0;
-  const agent = { id: basename(file, '.jsonl'), parent: isSubagent ? session : null, title: null, agentType: null, description: null, status: null, statusAt: 0 };
+  const agent = { id: basename(file, '.jsonl'), parent: isSubagent ? session : null, title: null, agentType: null, description: null, status: null, statusAt: 0, validating: null, checks: new Map() };
   agents.set(agent.id, agent);
   tracked.set(file, { offset: 0, agent, meta: isSubagent ? file.replace(/\.jsonl$/, '.meta.json') : null });
   broadcast({ type: 'agent', agent: publicAgent(agent) });

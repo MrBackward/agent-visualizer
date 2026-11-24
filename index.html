@@ -21,15 +21,16 @@
   #status::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; background: var(--muted); }
   #status.live::before { background: var(--done); box-shadow: 0 0 8px var(--done); }
   #summary { color: var(--ink2); margin: 2px 0 0; }
-  .row { display: grid; grid-template-columns: 10px 1fr auto; gap: 7px; align-items: center; width: 100%; padding: 3px 4px; margin: 0 -4px; border: 0; border-radius: 6px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+  .row { display: grid; grid-template-columns: 15px 1fr auto; gap: 7px; align-items: center; width: 100%; padding: 3px 4px; margin: 0 -4px; border: 0; border-radius: 6px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
   .row:hover, .row.pinned { background: var(--axis); }
-  .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .blob { width: 15px; height: 11px; flex: none; fill: currentColor; }
+  .blob .eyes { fill: var(--page); }
   .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .state { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
-  .detail { display: flex; gap: 6px; align-items: center; color: var(--muted); padding-left: 17px; }
+  .detail { display: flex; gap: 6px; align-items: center; color: var(--muted); padding-left: 22px; }
   .detail span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; min-width: 0; }
-  .sub { color: var(--ink2); padding-left: 17px; display: grid; grid-template-columns: 8px 1fr auto; gap: 6px; align-items: center; }
-  .sub .dot { width: 7px; height: 7px; }
+  .sub { color: var(--ink2); padding-left: 22px; display: grid; grid-template-columns: 12px 1fr auto; gap: 6px; align-items: center; }
+  .sub .blob { width: 12px; height: 9px; }
   .overlap { display: block; width: 100%; padding: 4px; margin: 0 -4px; border: 0; border-radius: 6px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
   .overlap:hover { background: var(--axis); }
   .overlap b { font-weight: 600; word-break: break-all; }
@@ -69,9 +70,10 @@
     <span><i class="mark delete"></i>delete</span>
     <span><i class="mark overlapped"></i>changed in two worktrees</span>
     <p>Agents</p>
-    <span><i class="dot" style="background: var(--ink)"></i>working</span>
-    <span><i class="dot" style="background: var(--stuck)"></i>still for 5+ min</span>
-    <span><i class="dot" style="background: var(--done)"></i>done</span>
+    <span id="key-working">working</span>
+    <span id="key-stuck">still for 5+ min</span>
+    <span id="key-done">done</span>
+    <span>In the validation box: running tests, lint, a build or another check</span>
   </div>
 </aside>
 <div id="controls" class="card">
@@ -102,6 +104,11 @@ const QUEUE_LIMIT = 8;
 const STUCK_AFTER_MS = 5 * 60_000;
 const SETTLE_MS = 10_000;
 const STILL_LABEL_MS = 30_000;
+const LINGER_MS = 4000;
+const BOX_TOP = 16;
+const BOX_RESERVE = 70;
+const SLOT_WIDTH = 300;
+const SLOT_HEIGHT = 26;
 const HEAT_MS = 10_000;
 const POP_MS = 450;
 const HOT_LABEL_MS = 45_000;
@@ -143,6 +150,7 @@ let files = [];
 let log = [];
 let zaps = [];
 let overlapKeys = new Set();
+let box = { left: 0, top: BOX_TOP, width: 0, height: 0, slots: new Map() };
 let trailMs = 15 * 60_000;
 let lookbackMs = 60 * 60_000;
 let pinnedSession = null;
@@ -165,6 +173,8 @@ const sessionOf = (agent) => agent.parent ?? agent.id;
 const staysFor = (agent) => (agent.status === 'done' ? Math.min(trailMs, lookbackMs) : lookbackMs);
 const isPresent = (agent, now) => now - Math.max(agent.lastTs, agent.statusAt ?? 0) < staysFor(agent);
 const stillSince = (agent) => Math.max(agent.lastTs, agent.restedAt ?? 0);
+// It lingers a few seconds after a check ends, so a run of quick checks does not bounce it in and out.
+const inBox = (agent, now) => agent.status !== 'done' && (Boolean(agent.validating) || now < agent.boxUntil);
 // 25 lines hold the bolt about 0.8s, 400 lines about 2s.
 const boltDuration = (lines) => (lines ? clamp(350 + Math.sqrt(lines) * 85, 450, LONGEST_BOLT_MS) : BOLT_MS);
 const toScreen = (point) => ({ x: (point.x - view.x) * view.k + view.width / 2, y: (point.y - view.y) * view.k + view.height / 2 });
@@ -192,7 +202,7 @@ function mix(from, to, amount) {
 
 function getAgent(id) {
   if (!agents.has(id)) {
-    agents.set(id, { id, parent: null, title: null, agentType: null, description: null, status: null, statusAt: 0, lastTs: 0, lastEvent: null, node: null, x: 0, y: 0, placed: false, moving: false });
+    agents.set(id, { id, parent: null, title: null, agentType: null, description: null, status: null, statusAt: 0, lastTs: 0, lastEvent: null, node: null, x: 0, y: 0, placed: false, moving: false, validating: null, boxUntil: 0 });
   }
   return agents.get(id);
 }
@@ -204,14 +214,15 @@ function agentLabel(agent) {
 
 // White while it works, green once its turn is over, red once it has sat still mid-turn for five minutes.
 function agentColour(agent, now) {
-  if (agent.moving) return theme.ink;
   if (agent.status === 'done') return theme.done;
+  if (agent.moving || inBox(agent, now)) return theme.ink;
   return mix(theme.ink, theme.stuck, clamp((now - stillSince(agent) - STUCK_AFTER_MS) / SETTLE_MS, 0, 1));
 }
 
-function agentState(agent, now) {
+function agentState(agent, now, brief) {
   if (agent.status === 'done') return `done ${ago(Math.max(agent.statusAt ?? 0, agent.lastTs))}`;
-  if (agent.moving) return 'moving';
+  if (agent.validating) return `${brief ? 'validating' : agent.validating.label} ${ago(agent.validating.since)}`;
+  if (agent.moving || inBox(agent, now)) return 'working';
   return now - stillSince(agent) > STILL_LABEL_MS ? `still ${ago(stillSince(agent))}` : 'working';
 }
 
@@ -519,6 +530,19 @@ function relax() {
   return Math.max(separateTrees(), ...shown.map((dir) => Math.hypot(dir.vx, dir.vy)));
 }
 
+function layoutBox(now) {
+  const boxed = [...agents.values()]
+    .filter((agent) => isPresent(agent, now) && inBox(agent, now))
+    .sort((first, second) => (first.validating?.since ?? Infinity) - (second.validating?.since ?? Infinity) || first.id.localeCompare(second.id));
+  const free = view.width - PANEL_INSET - 250;
+  const width = clamp(free, 330, 1240);
+  const left = PANEL_INSET + Math.max(0, (free - width) / 2);
+  const columns = Math.max(1, Math.floor((width - 28) / SLOT_WIDTH));
+  const rows = Math.ceil(boxed.length / columns);
+  const slots = new Map(boxed.map((agent, index) => [agent.id, { x: left + 30 + (index % columns) * SLOT_WIDTH, y: BOX_TOP + 46 + Math.floor(index / columns) * SLOT_HEIGHT }]));
+  box = { left, top: BOX_TOP, width, height: 32 + rows * SLOT_HEIGHT + (rows ? 4 : 0), slots };
+}
+
 function fire(zap, time) {
   zap.start = time;
   const node = nodes.get(zap.key);
@@ -534,6 +558,17 @@ function follow(time, elapsed) {
   });
   agents.forEach((agent) => {
     const mine = zaps.filter((zap) => zap.agent === agent.id);
+    const slot = box.slots.get(agent.id);
+    if (slot) {
+      // Quiet: a change made by the check shows on the file, with no bolt and no trip across the tree.
+      mine.filter((zap) => zap.start === null).forEach((zap) => fire(Object.assign(zap, { silent: true }), time));
+      const spot = toWorld(slot.x, slot.y);
+      const arriving = agent.placed && agent.moving;
+      const ease = arriving ? 1 - Math.exp(-elapsed / TRAVEL_EASE_MS) : 1;
+      Object.assign(agent, { x: agent.x + (spot.x - agent.x) * ease, y: agent.y + (spot.y - agent.y) * ease, placed: true });
+      agent.moving = Math.hypot(spot.x - agent.x, spot.y - agent.y) > 10 / view.k;
+      return;
+    }
     const queued = mine.filter((zap) => zap.start === null);
     const firing = mine.find((zap) => zap.start !== null && time - zap.start < zap.boltMs);
     const next = firing && queued.length <= QUEUE_LIMIT ? null : queued[0];
@@ -566,7 +601,7 @@ function follow(time, elapsed) {
 
 function agentPoint(agent, time) {
   const point = toScreen(agent);
-  if (agent.status === 'done') return point;
+  if (agent.status === 'done' || box.slots.has(agent.id)) return point;
   const phase = angleOf(agent.id);
   return { x: point.x + Math.cos(time / 1100 + phase) * 4, y: point.y + Math.sin(time / 800 + phase) * 5 };
 }
@@ -578,10 +613,10 @@ function fitCamera(ease = 0.06) {
   const top = Math.min(...shown.map((dir) => dir.y - dir.radius));
   const bottom = Math.max(...shown.map((dir) => dir.y + dir.radius));
   const inset = view.width > 720 ? PANEL_INSET : 0;
-  const scale = clamp(Math.min((view.width - inset - 160) / Math.max(right - left, 1), (view.height - 140) / Math.max(bottom - top, 1)), 0.1, 2.2);
+  const scale = clamp(Math.min((view.width - inset - 160) / Math.max(right - left, 1), (view.height - 140 - BOX_RESERVE) / Math.max(bottom - top, 1)), 0.1, 2.2);
   view.k += (scale - view.k) * ease;
   view.x += ((left + right) / 2 - inset / 2 / view.k - view.x) * ease;
-  view.y += ((top + bottom) / 2 - view.y) * ease;
+  view.y += ((top + bottom) / 2 - BOX_RESERVE / 2 / view.k - view.y) * ease;
 }
 
 function drawGlow(x, y, radius, colour, alpha) {
@@ -623,6 +658,39 @@ function drawMark(x, y, state, size) {
   context.fill();
   context.strokeStyle = state === 'read' ? colour : theme.surface;
   context.stroke();
+}
+
+// A boxy little creature: body, two arms, four legs, two eyes. `stride` is 0 or 1 while it walks, null when it stands.
+function drawBlob(x, y, unit, colour, stride) {
+  const left = Math.round(x - 5.5 * unit);
+  const top = Math.round(y - 4 * unit);
+  const cell = (column, row, width, height) => context.fillRect(left + column * unit, top + row * unit, width * unit, height * unit);
+  context.globalAlpha = 1;
+  context.fillStyle = colour;
+  cell(2, 0, 7, 6);
+  cell(0, 3, 11, 1);
+  [2, 4, 6, 8].forEach((column, index) => cell(column, 6, 1, stride === null || index % 2 === stride ? 2 : 1));
+  context.fillStyle = theme.page;
+  cell(3, 1, 1, 2);
+  cell(7, 1, 1, 2);
+}
+
+function drawBox() {
+  context.globalAlpha = 1;
+  context.fillStyle = 'rgba(26, 26, 25, 0.9)';
+  context.strokeStyle = 'rgba(255, 255, 255, 0.12)';
+  context.lineWidth = 1;
+  context.beginPath();
+  context.roundRect(box.left, box.top, box.width, box.height, 10);
+  context.fill();
+  context.stroke();
+  context.font = ROOT_FONT;
+  context.fillStyle = theme.ink;
+  context.fillText('Validation box', box.left + 14, box.top + 16);
+  const titleWidth = context.measureText('Validation box').width;
+  context.font = FONT;
+  context.fillStyle = theme.muted;
+  context.fillText(box.slots.size ? 'running tests, lint, a build or another check' : 'empty', box.left + 24 + titleWidth, box.top + 16.5);
 }
 
 function drawBolt(from, to, colour, strength, seed) {
@@ -675,7 +743,7 @@ function drawZap(zap, time, focus) {
   trace(node.dir ? node : node.parent);
   context.stroke();
 
-  if (age < zap.boltMs) drawBolt(agentPoint(agent, time), point, colour, Math.min(1, (zap.boltMs - age) / 260), zap.seed + Math.floor(age / 55));
+  if (age < zap.boltMs && !zap.silent) drawBolt(agentPoint(agent, time), point, colour, Math.min(1, (zap.boltMs - age) / 260), zap.seed + Math.floor(age / 55));
   drawGlow(point.x, point.y, 30, colour, fade ** 2 * 0.9);
 
   const burst = Math.floor(age / SPARK_MS);
@@ -783,41 +851,39 @@ function draw(time) {
   context.globalCompositeOperation = 'source-over';
   context.globalAlpha = 1;
 
+  drawBox();
   const parked = [...agents.values()]
-    .filter((agent) => agent.node && isPresent(agent, now) && (!focus || sessionOf(agent) === focus))
+    .filter((agent) => (agent.node || box.slots.has(agent.id)) && isPresent(agent, now) && (!focus || sessionOf(agent) === focus))
     .sort((first, second) => (second.status === 'done') - (first.status === 'done') || first.lastTs - second.lastTs);
   parked.forEach((agent) => {
+    const boxed = box.slots.has(agent.id);
     const point = agentPoint(agent, time);
-    const target = toScreen(agent.node);
-    const size = agent.parent ? 3.4 : 4.8;
+    const unit = agent.parent ? 1.5 : 2;
     const colour = agentColour(agent, now);
-    context.globalAlpha = 0.25;
-    context.strokeStyle = colour;
-    context.lineWidth = 1;
-    context.setLineDash([2, 4]);
-    context.beginPath();
-    context.moveTo(point.x, point.y);
-    context.lineTo(target.x, target.y);
-    context.stroke();
-    context.setLineDash([]);
-    context.globalCompositeOperation = 'lighter';
-    drawGlow(point.x, point.y, size * 4.5, colour, agent.status === 'done' ? 0.3 : 0.4 + 0.12 * Math.sin(time / 380 + angleOf(agent.id)));
-    context.globalCompositeOperation = 'source-over';
-    context.globalAlpha = 1;
-    context.fillStyle = colour;
-    context.strokeStyle = theme.page;
-    context.lineWidth = 1.5;
-    context.beginPath();
-    context.arc(point.x, point.y, size, 0, TAU);
-    context.fill();
-    context.stroke();
+    if (!boxed && agent.node) {
+      const target = toScreen(agent.node);
+      context.globalAlpha = 0.25;
+      context.strokeStyle = colour;
+      context.lineWidth = 1;
+      context.setLineDash([2, 4]);
+      context.beginPath();
+      context.moveTo(point.x, point.y);
+      context.lineTo(target.x, target.y);
+      context.stroke();
+      context.setLineDash([]);
+      context.globalCompositeOperation = 'lighter';
+      drawGlow(point.x, point.y, unit * 13, colour, agent.status === 'done' ? 0.25 : 0.35 + 0.1 * Math.sin(time / 380 + angleOf(agent.id)));
+      context.globalCompositeOperation = 'source-over';
+    }
+    drawBlob(point.x, point.y, unit, colour, agent.moving ? Math.floor(time / 140) % 2 : null);
   });
   [...parked].reverse().forEach((agent) => {
     const point = agentPoint(agent, time);
+    const boxed = box.slots.has(agent.id);
     const name = agentLabel(agent);
-    const short = name.length > 30 ? `${name.slice(0, 29)}…` : name;
+    const short = name.length > (boxed ? 14 : 30) ? `${name.slice(0, boxed ? 13 : 29)}…` : name;
     const state = agentState(agent, now);
-    drawLabel(state === 'working' || state === 'moving' ? short : `${short} · ${state}`, point.x + 10, point.y, theme.ink, placed);
+    drawLabel(state === 'working' ? short : `${short} · ${state}`, point.x + (agent.parent ? 14 : 17), point.y, boxed ? theme.ink2 : theme.ink, placed);
   });
 
   context.font = ROOT_FONT;
@@ -856,8 +922,9 @@ function frame(time) {
   lastDraw = time;
   settleStructure();
   relax();
-  follow(time, elapsed);
   fitCamera();
+  layoutBox(Date.now());
+  follow(time, elapsed);
   draw(time);
 }
 
@@ -868,18 +935,22 @@ function make(tag, className, text) {
   return element;
 }
 
-function statusDot(agent, now) {
-  const dot = make('span', 'dot');
-  dot.style.background = agentColour(agent, now);
-  return dot;
+function blobIcon(colour) {
+  const holder = document.createElement('template');
+  holder.innerHTML = '<svg class="blob" viewBox="0 0 11 8" aria-hidden="true"><rect x="2" width="7" height="6"/><rect y="3" width="11" height="1"/><rect x="2" y="6" width="1" height="2"/><rect x="4" y="6" width="1" height="2"/><rect x="6" y="6" width="1" height="2"/><rect x="8" y="6" width="1" height="2"/><rect class="eyes" x="3" y="1" width="1" height="2"/><rect class="eyes" x="7" y="1" width="1" height="2"/></svg>';
+  const icon = holder.content.firstChild;
+  icon.style.color = colour;
+  return icon;
 }
+
+const statusDot = (agent, now) => blobIcon(agentColour(agent, now));
 
 function renderFamily(family, now) {
   const { session, members } = family;
   const row = make('button', `row${pinnedSession === session.id ? ' pinned' : ''}`);
   row.dataset.session = session.id;
   row.title = pinnedSession === session.id ? 'Click to show every agent again' : 'Click to show only this session';
-  row.append(statusDot(session, now), make('span', 'name', agentLabel(session)), make('span', 'state', session.lastEvent ? agentState(session, now) : session.status ?? ''));
+  row.append(statusDot(session, now), make('span', 'name', agentLabel(session)), make('span', 'state', session.lastEvent ? agentState(session, now, true) : session.status ?? ''));
   const parts = [row];
   if (session.lastEvent) {
     const { kind, via, path, repo } = session.lastEvent;
@@ -893,7 +964,7 @@ function renderFamily(family, now) {
     .forEach((member) => {
       const line = make('div', 'sub');
       const text = member.description ? `${agentLabel(member)} · ${member.description}` : agentLabel(member);
-      line.append(statusDot(member, now), make('span', 'name', text), make('span', 'state', agentState(member, now)));
+      line.append(statusDot(member, now), make('span', 'name', text), make('span', 'state', agentState(member, now, true)));
       parts.push(line);
     });
   if (members.length > 6) parts.push(make('div', 'detail', `${members.length - 6} more`));
@@ -942,10 +1013,11 @@ function renderPanel() {
   elements.overlaps.replaceChildren(...(overlaps.length ? [make('h2', '', 'Changed in two worktrees'), ...overlapRows] : []));
 
   const finished = present.filter((agent) => agent.status === 'done').length;
+  const validating = [...agents.values()].filter((agent) => agent.validating && isPresent(agent, now)).length;
   const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
-  elements.summary.textContent = `${present.length - finished} working · ${finished} done · ${plural(trees.length, 'repo')} · ${plural(files.length, 'file')} · ${plural(overlaps.length, 'overlap')}`;
+  elements.summary.textContent = `${present.length - finished} working · ${validating} validating · ${finished} done · ${plural(trees.length, 'repo')} · ${plural(files.length, 'file')} · ${plural(overlaps.length, 'overlap')}`;
   elements.empty.hidden = dirs.length > 0;
-  if (present.length > finished) wake();
+  if (present.length > finished || validating) wake();
 }
 
 function showTooltip(node, x, y) {
@@ -1009,13 +1081,18 @@ const handlers = {
     rebuild();
   },
   event(message) {
+    const agent = getAgent(message.event.agent);
+    if (!agent.validating) agent.boxUntil = 0;
     log.push(message.event);
     applyEvent(message.event, true);
     panelDirty = true;
     wake();
   },
   agent(message) {
-    Object.assign(getAgent(message.agent.id), message.agent);
+    const agent = getAgent(message.agent.id);
+    const checkEnded = agent.validating && !message.agent.validating;
+    Object.assign(agent, message.agent);
+    if (checkEnded) Object.assign(agent, { boxUntil: Date.now() + LINGER_MS, restedAt: Date.now() + LINGER_MS });
     panelDirty = true;
     wake();
   },
@@ -1102,6 +1179,7 @@ if ([...elements.trail.options].some((option) => option.value === requestedTrail
   trailMs = requestedTrail === 'all' ? Infinity : Number(requestedTrail) * 60_000;
 }
 
+[['key-working', theme.ink], ['key-stuck', theme.stuck], ['key-done', theme.done]].forEach(([id, colour]) => document.getElementById(id).prepend(blobIcon(colour)));
 resize();
 requestAnimationFrame(frame);
 setInterval(expire, 5000);
