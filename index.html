@@ -161,7 +161,9 @@ const wake = () => { wakeUntil = performance.now() + 6000; };
 const cutoffNow = () => Date.now() - trailMs;
 const keyOf = (repo, path) => `${repo}\n${path}`;
 const sessionOf = (agent) => agent.parent ?? agent.id;
-const isPresent = (agent, now) => now - Math.max(agent.lastTs, agent.statusAt ?? 0) < lookbackMs;
+// A finished agent leaves with the trail; one still mid-turn stays parked for as long as the server looks back.
+const staysFor = (agent) => (agent.status === 'done' ? Math.min(trailMs, lookbackMs) : lookbackMs);
+const isPresent = (agent, now) => now - Math.max(agent.lastTs, agent.statusAt ?? 0) < staysFor(agent);
 const stillSince = (agent) => Math.max(agent.lastTs, agent.restedAt ?? 0);
 // 25 lines hold the bolt about 0.8s, 400 lines about 2s.
 const boltDuration = (lines) => (lines ? clamp(350 + Math.sqrt(lines) * 85, 450, LONGEST_BOLT_MS) : BOLT_MS);
@@ -277,7 +279,10 @@ function rebuild() {
   // Each agent's last action outlives the trail, so the agent stays parked where it last was.
   const latest = new Map();
   log.forEach((event) => { if (!(latest.get(event.agent)?.ts > event.ts)) latest.set(event.agent, event); });
-  const anchors = new Set([...latest.values()].filter((event) => now - Math.max(event.ts, getAgent(event.agent).statusAt ?? 0) < lookbackMs));
+  const anchors = new Set([...latest.values()].filter((event) => {
+    const agent = getAgent(event.agent);
+    return now - Math.max(event.ts, agent.statusAt ?? 0) < staysFor(agent);
+  }));
   const firstLoad = !nodes.size;
   previousNodes = nodes;
   nodes = new Map();
