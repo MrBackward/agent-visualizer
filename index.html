@@ -1,0 +1,974 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Visualizer</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--page); color: var(--ink); font: 12px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+  canvas.dragging { cursor: grabbing; }
+  .card { background: color-mix(in srgb, var(--surface) 88%, transparent); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 10px; }
+  #panel { position: fixed; top: 16px; left: 16px; width: min(284px, calc(100vw - 32px)); max-height: calc(100vh - 32px); overflow-y: auto; padding: 14px; }
+  #panel header { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+  h1 { font-size: 14px; font-weight: 650; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  h2 { font-size: 11px; font-weight: 600; color: var(--ink2); margin: 14px 0 4px; display: flex; gap: 6px; align-items: baseline; white-space: nowrap; }
+  h2 small { font-weight: 400; color: var(--muted); overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  #status { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  #status::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; background: var(--muted); }
+  #status.live::before { background: #0ca30c; box-shadow: 0 0 8px #0ca30c; }
+  #summary { color: var(--ink2); margin: 2px 0 0; }
+  .row { display: grid; grid-template-columns: 1fr auto; gap: 6px; align-items: center; width: 100%; padding: 3px 4px; margin: 0 -4px; border: 0; border-radius: 6px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+  .row:hover, .row.pinned { background: var(--axis); }
+  .idle { opacity: 0.55; }
+  .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ago { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .detail { display: flex; gap: 6px; align-items: center; color: var(--muted); padding-left: 8px; }
+  .detail span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; min-width: 0; }
+  .sub { color: var(--ink2); padding-left: 8px; display: flex; gap: 6px; justify-content: space-between; }
+  .overlap { display: block; width: 100%; padding: 4px; margin: 0 -4px; border: 0; border-radius: 6px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+  .overlap:hover { background: var(--axis); }
+  .overlap b { font-weight: 600; word-break: break-all; }
+  .overlap span { display: block; color: var(--muted); }
+  #key { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--axis); color: var(--ink2); }
+  #key span { display: inline-flex; align-items: center; gap: 6px; }
+  .mark { width: 9px; height: 9px; flex: none; display: inline-block; }
+  .mark.read { border: 1.5px solid var(--read); border-radius: 50%; }
+  .mark.modify { background: var(--modify); border-radius: 50%; }
+  .mark.write { background: var(--write); transform: rotate(45deg) scale(0.82); }
+  .mark.delete { background: linear-gradient(45deg, transparent 40%, var(--delete) 40% 60%, transparent 60%), linear-gradient(-45deg, transparent 40%, var(--delete) 40% 60%, transparent 60%); }
+  .mark.overlapped { border: 1.5px dashed var(--ink); border-radius: 50%; }
+  #controls { position: fixed; top: 16px; right: 16px; display: flex; gap: 8px; align-items: center; padding: 6px 8px; color: var(--ink2); }
+  #controls select, #controls button { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px; padding: 3px 8px; cursor: pointer; }
+  #tooltip { position: fixed; pointer-events: none; padding: 8px 10px; max-width: 420px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4); }
+  #tooltip b { display: block; font-weight: 600; word-break: break-all; margin-bottom: 4px; }
+  #tooltip div { display: flex; gap: 14px; justify-content: space-between; color: var(--ink2); }
+  #tooltip em { font-style: normal; color: var(--muted); }
+  #empty { position: fixed; inset: 0; display: grid; place-items: center; color: var(--muted); pointer-events: none; font-size: 13px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="empty">Waiting for agent activity…</div>
+<aside id="panel" class="card">
+  <header><h1 id="repo">Agent Visualizer</h1><span id="status">connecting</span></header>
+  <p id="summary"></p>
+  <section id="agents"></section>
+  <section id="overlaps"></section>
+  <div id="key">
+    <span><i class="mark read"></i>read</span>
+    <span><i class="mark write"></i>write (new file)</span>
+    <span><i class="mark modify"></i>modify</span>
+    <span><i class="mark delete"></i>delete</span>
+    <span><i class="mark overlapped"></i>changed in two worktrees</span>
+  </div>
+</aside>
+<div id="controls" class="card">
+  <label for="trail">Trail</label>
+  <select id="trail">
+    <option value="5">5 min</option>
+    <option value="15" selected>15 min</option>
+    <option value="60">1 hour</option>
+    <option value="all">Everything loaded</option>
+  </select>
+  <button id="fit" title="Fit the tree to the window (F)">Fit</button>
+</div>
+<div id="tooltip" class="card" hidden></div>
+
+<script>
+const TAU = Math.PI * 2;
+const LIVE_MS = 90_000;
+const ZAP_MS = 1300;
+const BOLT_MS = 560;
+const LONGEST_BOLT_MS = 3200;
+const AFTERGLOW_MS = 740;
+const SPARK_MS = 700;
+const TRAVEL_MS = 2600;
+const CHARGE_MS = 220;
+const TRAVEL_EASE_MS = 320;
+const DRIFT_EASE_MS = 600;
+const STAND_OFF = 62;
+const QUEUE_LIMIT = 8;
+const HEAT_MS = 10_000;
+const POP_MS = 450;
+const HOT_LABEL_MS = 45_000;
+const DIR_RADIUS = 6;
+const RING_START = 10;
+const RING_GAP = 8;
+const PANEL_INSET = 316;
+const CLEARANCE = 22;
+const REPEL_RANGE = 60;
+const BRANCH_LENGTH = 34;
+const WARM_UP_STEPS = 2000;
+const FONT = '11px system-ui, -apple-system, "Segoe UI", sans-serif';
+const ACTIONS = ['write', 'modify', 'delete', 'read'];
+const theme = {
+  page: '#0d0d0d', surface: '#1a1a19', ink: '#f0efec', ink2: '#c3c2b7', muted: '#898781', axis: '#383835',
+  read: '#d17d10', write: '#199e70', modify: '#3987e5', delete: '#c93434',
+};
+Object.entries(theme).forEach(([name, value]) => document.documentElement.style.setProperty(`--${name}`, value));
+
+const canvas = document.getElementById('stage');
+const context = canvas.getContext('2d');
+const elements = Object.fromEntries(
+  ['repo', 'status', 'summary', 'agents', 'overlaps', 'tooltip', 'empty', 'trail', 'fit'].map((id) => [id, document.getElementById(id)]),
+);
+
+const view = { width: 0, height: 0, x: 0, y: 0, k: 1, autoFit: true };
+let repo = '';
+let worktrees = new Map();
+let agents = new Map();
+let nodes = new Map();
+let previousNodes = new Map();
+let dirs = [];
+let shown = [];
+let files = [];
+let log = [];
+let zaps = [];
+let overlapPaths = new Set();
+let trailMs = 15 * 60_000;
+let pinnedSession = null;
+let hoveredSession = null;
+let hoveredNode = null;
+let drag = null;
+let replaying = false;
+let panelDirty = true;
+let layoutDirty = true;
+let wakeUntil = 0;
+let lastDraw = 0;
+
+const clamp = (value, low, high) => Math.min(Math.max(value, low), high);
+const noise = (seed) => Math.abs(Math.sin(seed * 12.9898) * 43758.5453) % 1;
+const wake = () => { wakeUntil = performance.now() + 6000; };
+const cutoffNow = () => Date.now() - trailMs;
+const sessionOf = (agent) => agent.parent ?? agent.id;
+// 25 lines hold the bolt about 0.8s, 400 lines about 2s.
+const boltDuration = (lines) => (lines ? clamp(350 + Math.sqrt(lines) * 85, 450, LONGEST_BOLT_MS) : BOLT_MS);
+const toScreen = (point) => ({ x: (point.x - view.x) * view.k + view.width / 2, y: (point.y - view.y) * view.k + view.height / 2 });
+const toWorld = (x, y) => ({ x: (x - view.width / 2) / view.k + view.x, y: (y - view.height / 2) / view.k + view.y });
+
+function ago(ts) {
+  const seconds = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (seconds < 5) return 'now';
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  return `${Math.floor(seconds / 3600)}h`;
+}
+
+function angleOf(text) {
+  const hash = [...text].reduce((total, character) => (total * 31 + character.charCodeAt(0)) % 3600, 7);
+  return (hash / 3600) * TAU;
+}
+
+function getAgent(id) {
+  if (!agents.has(id)) agents.set(id, { id, parent: null, title: null, agentType: null, description: null, lastTs: 0, lastEvent: null, node: null, x: 0, y: 0 });
+  return agents.get(id);
+}
+
+function agentLabel(agent) {
+  if (agent.parent) return agent.agentType ?? 'subagent';
+  return agent.title ?? `Session ${agent.id.slice(0, 8)}`;
+}
+
+function createNode(path, dir) {
+  const slash = path.lastIndexOf('/');
+  const parent = path === '' ? null : ensureNode(path.slice(0, Math.max(slash, 0)), true);
+  const before = previousNodes.get(path);
+  const node = {
+    path, dir, parent,
+    name: path === '' ? repo : path.slice(slash + 1),
+    x: before?.x ?? parent?.x ?? 0,
+    y: before?.y ?? parent?.y ?? 0,
+    vx: 0, vy: 0, offsetX: 0, offsetY: 0, radius: DIR_RADIUS,
+    seeded: Boolean(before?.seeded), hidden: false, label: '', layoutParent: null, layoutChildren: [],
+    files: [], children: [], dirty: false,
+    touches: new Map(), sessions: new Set(), writers: new Map(),
+    lastTs: 0, state: 'read',
+    bornAt: replaying || dir ? -Infinity : Infinity, flashAt: -Infinity,
+  };
+  nodes.set(path, node);
+  layoutDirty = true;
+  if (dir) {
+    dirs.push(node);
+    parent?.children.push(node);
+  } else {
+    files.push(node);
+    parent.files.push(node);
+    parent.dirty = true;
+  }
+  return node;
+}
+
+const ensureNode = (path, dir) => nodes.get(path) ?? createNode(path, dir);
+
+function applyEvent(event, animate) {
+  const node = ensureNode(event.path, event.dir);
+  const agent = getAgent(event.agent);
+  const touch = node.touches.get(agent.id) ?? { read: 0, write: 0, modify: 0, delete: 0, ts: 0 };
+  touch[event.kind] += 1;
+  touch.ts = Math.max(touch.ts, event.ts);
+  node.touches.set(agent.id, touch);
+  node.sessions.add(sessionOf(agent));
+  if (event.ts >= node.lastTs) {
+    layoutDirty ||= node.dir && !node.lastTs;
+    node.lastTs = event.ts;
+  }
+  if (event.kind !== 'read') {
+    node.writers.set(event.wt, event.ts);
+    node.state = event.kind === 'modify' && node.state === 'write' ? 'write' : event.kind;
+  }
+  if (event.ts >= agent.lastTs) {
+    agent.lastTs = event.ts;
+    agent.lastEvent = event;
+    agent.node = node;
+  }
+  if (animate) zaps.push({ path: event.path, agent: agent.id, kind: event.kind, via: event.via, queuedAt: performance.now(), start: null, boltMs: boltDuration(event.lines), seed: Math.random() * 1000 });
+}
+
+function rebuild() {
+  const cutoff = cutoffNow();
+  if (log.length > 60_000) log = log.slice(-50_000);
+  previousNodes = nodes;
+  nodes = new Map();
+  dirs = [];
+  files = [];
+  hoveredNode = null;
+  elements.tooltip.hidden = true;
+  agents.forEach((agent) => Object.assign(agent, { lastTs: 0, lastEvent: null, node: null }));
+  replaying = true;
+  ensureNode('', true);
+  log.filter((event) => event.ts >= cutoff).forEach((event) => applyEvent(event, false));
+  replaying = false;
+  previousNodes = new Map();
+  settleStructure();
+  Array.from({ length: WARM_UP_STEPS }).some(() => relax() < 0.05);
+  files.forEach((file) => Object.assign(file, { x: file.parent.x + file.offsetX, y: file.parent.y + file.offsetY }));
+  panelDirty = true;
+  wake();
+}
+
+function expire() {
+  const cutoff = cutoffNow();
+  const expired = (node) => node.lastTs > 0 && node.lastTs < cutoff;
+  if (files.some(expired) || dirs.some(expired)) rebuild();
+}
+
+function arrange(dir) {
+  let ring = 0;
+  let used = 0;
+  const capacityOf = (index) => Math.floor((TAU * (RING_START + index * RING_GAP)) / 9);
+  dir.files.sort((first, second) => first.name.localeCompare(second.name));
+  dir.files.forEach((file) => {
+    if (used === capacityOf(ring)) {
+      ring += 1;
+      used = 0;
+    }
+    const angle = (used / capacityOf(ring)) * TAU + ring * 0.5;
+    const distance = RING_START + ring * RING_GAP;
+    file.offsetX = Math.cos(angle) * distance;
+    file.offsetY = Math.sin(angle) * distance;
+    used += 1;
+  });
+  dir.radius = dir.files.length ? RING_START + ring * RING_GAP + 7 : DIR_RADIUS;
+  dir.dirty = false;
+}
+
+// A new folder takes the roomiest spot pointing away from its grandparent, so adding it never moves the rest of the tree.
+function seedDir(dir) {
+  dir.seeded = true;
+  const parent = dir.layoutParent;
+  if (!parent) return;
+  const formerChild = dirs.find((other) => other.seeded && other !== dir && other.layoutParent === parent && other.path.startsWith(`${dir.path}/`));
+  if (formerChild) {
+    Object.assign(dir, { x: (parent.x + formerChild.x) / 2, y: (parent.y + formerChild.y) / 2 });
+    return;
+  }
+  const grandparent = parent.layoutParent;
+  const outward = grandparent ? Math.atan2(parent.y - grandparent.y, parent.x - grandparent.x) : angleOf(dir.path);
+  const offsets = grandparent ? [0, 0.5, -0.5, 1, -1, 1.5, -1.5] : Array.from({ length: 16 }, (_, index) => (index / 16) * TAU);
+  const reach = parent.radius + dir.radius + BRANCH_LENGTH + 12;
+  const placed = dirs.filter((other) => other.seeded && !other.hidden && other !== dir && other !== parent);
+  const [roomiest] = offsets
+    .map((offset) => {
+      const x = parent.x + Math.cos(outward + offset) * reach;
+      const y = parent.y + Math.sin(outward + offset) * reach;
+      const room = Math.min(400, ...placed.map((other) => Math.hypot(other.x - x, other.y - y) - other.radius));
+      return { x, y, room };
+    })
+    .sort((first, second) => second.room - first.room);
+  Object.assign(dir, { x: roomiest.x, y: roomiest.y });
+}
+
+// First load only: a radial tree gives every subtree its own wedge, so the starting picture has no crossed branches.
+function seedAll() {
+  const levels = [];
+  const weightOf = (list) => list.reduce((sum, dir) => sum + dir.weight, 0);
+  const weigh = (dir, level) => {
+    (levels[level] ??= []).push(dir);
+    dir.layoutChildren.sort((first, second) => first.label.localeCompare(second.label));
+    dir.layoutChildren.forEach((child) => weigh(child, level + 1));
+    dir.weight = Math.max((dir.radius * 2 + CLEARANCE) / Math.max(level, 1), weightOf(dir.layoutChildren));
+  };
+  const spread = (dir, start, sweep) => {
+    dir.angle = start + sweep / 2;
+    dir.sweep = sweep;
+    const usable = dir.layoutParent ? Math.min(sweep, Math.PI) : sweep;
+    const share = usable / (weightOf(dir.layoutChildren) || 1);
+    let cursor = start + (sweep - usable) / 2;
+    dir.layoutChildren.forEach((child) => {
+      spread(child, cursor, child.weight * share);
+      cursor += child.weight * share;
+    });
+  };
+  const root = nodes.get('');
+  weigh(root, 0);
+  spread(root, 0, TAU);
+
+  const widest = (level) => Math.max(...level.map((dir) => dir.radius));
+  let distance = 0;
+  levels.forEach((level, index) => {
+    if (index > 0) {
+      const fitsArc = Math.max(...level.map((dir) => (dir.radius * 2 + CLEARANCE) / dir.sweep));
+      distance = Math.max(distance + widest(levels[index - 1]) + widest(level) + BRANCH_LENGTH, fitsArc);
+    }
+    level.forEach((dir) => Object.assign(dir, { x: Math.cos(dir.angle) * distance, y: Math.sin(dir.angle) * distance, seeded: true }));
+  });
+}
+
+function settleStructure() {
+  dirs.forEach((dir) => { if (dir.dirty) arrange(dir); });
+  if (!layoutDirty) return;
+  layoutDirty = false;
+  shown = [];
+  const firstLoad = !dirs.some((dir) => dir.seeded && dir.parent);
+  const visit = (dir, layoutParent, prefix) => {
+    const passThrough = dir.parent && !dir.files.length && dir.children.length === 1 && !dir.lastTs;
+    dir.hidden = Boolean(passThrough);
+    if (passThrough) {
+      visit(dir.children[0], layoutParent, `${prefix}${dir.name}/`);
+      return;
+    }
+    dir.label = `${prefix}${dir.name}`;
+    dir.layoutParent = layoutParent;
+    dir.layoutChildren = [];
+    layoutParent?.layoutChildren.push(dir);
+    if (!dir.seeded && !firstLoad) {
+      seedDir(dir);
+      dir.files.forEach((file) => Object.assign(file, { x: dir.x, y: dir.y }));
+    }
+    shown.push(dir);
+    dir.children.forEach((child) => visit(child, dir, ''));
+  };
+  visit(nodes.get(''), null, '');
+  if (firstLoad) seedAll();
+}
+
+function relax() {
+  shown.forEach((first, firstIndex) => shown.forEach((second, secondIndex) => {
+    if (secondIndex <= firstIndex) return;
+    const dx = second.x - first.x || 0.01;
+    const dy = second.y - first.y || 0.01;
+    const distance = Math.hypot(dx, dy);
+    const gap = distance - (first.radius + second.radius + CLEARANCE);
+    if (gap > REPEL_RANGE) return;
+    const push = gap < 0 ? 0.5 - gap * 0.18 : 0.5 * (1 - gap / REPEL_RANGE);
+    first.vx -= (dx / distance) * push;
+    first.vy -= (dy / distance) * push;
+    second.vx += (dx / distance) * push;
+    second.vy += (dy / distance) * push;
+  }));
+
+  // Each pull on a folder is matched on its parent: unequal pulls leave a net torque and the whole tree turns forever.
+  shown.forEach((dir) => {
+    const parent = dir.layoutParent;
+    if (!parent) return;
+    const dx = dir.x - parent.x;
+    const dy = dir.y - parent.y;
+    const distance = Math.hypot(dx, dy) || 1;
+    const pull = (distance - (parent.radius + dir.radius + BRANCH_LENGTH)) * 0.06;
+    dir.vx -= (dx / distance) * pull;
+    dir.vy -= (dy / distance) * pull;
+    parent.vx += (dx / distance) * pull;
+    parent.vy += (dy / distance) * pull;
+  });
+
+  shown.forEach((dir) => {
+    if (!dir.layoutParent) {
+      Object.assign(dir, { x: 0, y: 0, vx: 0, vy: 0 });
+      return;
+    }
+    dir.vx = Math.abs(dir.vx) < 0.02 ? 0 : clamp(dir.vx * 0.72, -14, 14);
+    dir.vy = Math.abs(dir.vy) < 0.02 ? 0 : clamp(dir.vy * 0.72, -14, 14);
+    dir.x += dir.vx;
+    dir.y += dir.vy;
+  });
+  return Math.max(0, ...shown.map((dir) => Math.hypot(dir.vx, dir.vy)));
+}
+
+function fire(zap, time) {
+  zap.start = time;
+  const node = nodes.get(zap.path);
+  if (!node) return;
+  node.flashAt = time;
+  if (node.bornAt === Infinity) node.bornAt = time;
+}
+
+function follow(time, elapsed) {
+  files.forEach((file) => {
+    file.x += (file.parent.x + file.offsetX - file.x) * 0.2;
+    file.y += (file.parent.y + file.offsetY - file.y) * 0.2;
+  });
+  agents.forEach((agent) => {
+    const mine = zaps.filter((zap) => zap.agent === agent.id);
+    const queued = mine.filter((zap) => zap.start === null);
+    const firing = mine.find((zap) => zap.start !== null && time - zap.start < zap.boltMs);
+    const next = firing && queued.length <= QUEUE_LIMIT ? null : queued[0];
+    const node = nodes.get((next ?? firing)?.path) ?? agent.node;
+    if (!node) {
+      if (next) fire(next, time);
+      return;
+    }
+    const angle = angleOf(agent.id);
+    const spotX = node.x + (Math.cos(angle) * STAND_OFF) / view.k;
+    const spotY = node.y + (Math.sin(angle) * STAND_OFF) / view.k;
+    const ease = 1 - Math.exp(-elapsed / (next ? TRAVEL_EASE_MS : DRIFT_EASE_MS));
+    agent.x += (spotX - agent.x) * ease;
+    agent.y += (spotY - agent.y) * ease;
+    if (!next) return;
+    next.setOffAt ??= time;
+    if (Math.hypot(spotX - agent.x, spotY - agent.y) < 22 / view.k) next.arrivedAt ??= time;
+    const charged = time - next.arrivedAt > CHARGE_MS;
+    if (charged || time - next.setOffAt > TRAVEL_MS || queued.length > QUEUE_LIMIT) fire(next, time);
+  });
+}
+
+function agentPoint(agent, time) {
+  const point = toScreen(agent);
+  const phase = angleOf(agent.id);
+  return { x: point.x + Math.cos(time / 1100 + phase) * 4, y: point.y + Math.sin(time / 800 + phase) * 5 };
+}
+
+function fitCamera() {
+  if (!view.autoFit || !shown.length) return;
+  const left = Math.min(...shown.map((dir) => dir.x - dir.radius));
+  const right = Math.max(...shown.map((dir) => dir.x + dir.radius));
+  const top = Math.min(...shown.map((dir) => dir.y - dir.radius));
+  const bottom = Math.max(...shown.map((dir) => dir.y + dir.radius));
+  const inset = view.width > 720 ? PANEL_INSET : 0;
+  const scale = clamp(Math.min((view.width - inset - 160) / Math.max(right - left, 1), (view.height - 140) / Math.max(bottom - top, 1)), 0.1, 2.2);
+  view.k += (scale - view.k) * 0.06;
+  view.x += ((left + right) / 2 - inset / 2 / view.k - view.x) * 0.06;
+  view.y += ((top + bottom) / 2 - view.y) * 0.06;
+}
+
+function drawGlow(x, y, radius, colour, alpha) {
+  const glow = context.createRadialGradient(x, y, 0, x, y, radius);
+  glow.addColorStop(0, colour);
+  glow.addColorStop(1, 'transparent');
+  context.globalAlpha = alpha;
+  context.fillStyle = glow;
+  context.beginPath();
+  context.arc(x, y, radius, 0, TAU);
+  context.fill();
+}
+
+function drawMark(x, y, state, size) {
+  const colour = theme[state];
+  context.beginPath();
+  if (state === 'delete') {
+    context.moveTo(x - size, y - size);
+    context.lineTo(x + size, y + size);
+    context.moveTo(x + size, y - size);
+    context.lineTo(x - size, y + size);
+    context.strokeStyle = colour;
+    context.lineWidth = 2;
+    context.stroke();
+    return;
+  }
+  if (state === 'write') {
+    const reach = size * 1.35;
+    context.moveTo(x, y - reach);
+    context.lineTo(x + reach, y);
+    context.lineTo(x, y + reach);
+    context.lineTo(x - reach, y);
+    context.closePath();
+  } else {
+    context.arc(x, y, size, 0, TAU);
+  }
+  context.lineWidth = 1.5;
+  context.fillStyle = state === 'read' ? theme.surface : colour;
+  context.fill();
+  context.strokeStyle = state === 'read' ? colour : theme.surface;
+  context.stroke();
+}
+
+function drawBolt(from, to, colour, strength, seed) {
+  const length = Math.hypot(to.x - from.x, to.y - from.y);
+  if (length < 6) return;
+  const steps = clamp(Math.round(length / 24), 2, 14);
+  const sway = Math.min(length * 0.12, 15);
+  const points = Array.from({ length: steps + 1 }, (_, index) => {
+    const along = index / steps;
+    const offset = index === 0 || index === steps ? 0 : (noise(seed + index * 7.31) - 0.5) * 2 * sway;
+    return {
+      x: from.x + (to.x - from.x) * along - ((to.y - from.y) / length) * offset,
+      y: from.y + (to.y - from.y) * along + ((to.x - from.x) / length) * offset,
+    };
+  });
+  [[14, 0.14, colour], [6, 0.45, colour], [2, 1, '#ffffff']].forEach(([width, alpha, stroke]) => {
+    context.globalAlpha = alpha * strength;
+    context.strokeStyle = stroke;
+    context.lineWidth = width;
+    context.beginPath();
+    points.forEach((point, index) => (index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y)));
+    context.stroke();
+  });
+}
+
+function drawZap(zap, time, focus) {
+  const node = nodes.get(zap.path);
+  const agent = agents.get(zap.agent);
+  if (!node || node.hidden || (focus && sessionOf(agent) !== focus)) return;
+  const age = time - zap.start;
+  const fade = clamp((zap.boltMs + AFTERGLOW_MS - age) / AFTERGLOW_MS, 0, 1);
+  const colour = theme[zap.kind];
+  const point = toScreen(node);
+
+  const branch = node.dir ? node : node.parent;
+  const trace = (dir) => {
+    if (!dir.layoutParent) return;
+    const from = toScreen(dir);
+    const to = toScreen(dir.layoutParent);
+    context.moveTo(from.x, from.y);
+    context.lineTo(to.x, to.y);
+    trace(dir.layoutParent);
+  };
+  context.globalAlpha = fade * 0.5;
+  context.strokeStyle = colour;
+  context.lineWidth = 2;
+  context.beginPath();
+  trace(branch);
+  context.stroke();
+
+  if (age < zap.boltMs) drawBolt(agentPoint(agent, time), point, colour, Math.min(1, (zap.boltMs - age) / 260), zap.seed + Math.floor(age / 55));
+
+  drawGlow(point.x, point.y, 30, colour, fade ** 2 * 0.9);
+  if (age < 140) drawGlow(point.x, point.y, 14, '#ffffff', 1 - age / 140);
+
+  const burst = Math.floor(age / SPARK_MS);
+  if (burst * SPARK_MS > zap.boltMs) return;
+  const spray = (age % SPARK_MS) / SPARK_MS;
+  context.globalAlpha = 1 - spray;
+  context.fillStyle = colour;
+  Array.from({ length: 7 }).forEach((_, index) => {
+    const angle = noise(zap.seed + burst * 17 + index) * TAU;
+    const reach = (1 - (1 - spray) ** 2) * (16 + noise(zap.seed + burst * 5 + index * 3.7) * 26);
+    context.beginPath();
+    context.arc(point.x + Math.cos(angle) * reach, point.y + Math.sin(angle) * reach, 1.6 * (1 - spray), 0, TAU);
+    context.fill();
+  });
+}
+
+function drawLabel(text, x, y, colour, placed) {
+  const width = context.measureText(text).width;
+  const box = { left: x - 3, right: x + width + 3, top: y - 8, bottom: y + 8 };
+  const collides = placed.some((other) => box.left < other.right && box.right > other.left && box.top < other.bottom && box.bottom > other.top);
+  if (collides) return;
+  placed.push(box);
+  context.strokeStyle = theme.page;
+  context.lineWidth = 3;
+  context.strokeText(text, x, y);
+  context.fillStyle = colour;
+  context.fillText(text, x, y);
+}
+
+function draw(time) {
+  const now = Date.now();
+  const focus = pinnedSession ?? hoveredSession;
+  const dotScale = clamp(view.k, 0.55, 1.8);
+  const fadeSpan = Number.isFinite(trailMs) ? trailMs : 3_600_000;
+  const visible = (node) => !focus || node.sessions.has(focus);
+  const placed = [];
+
+  context.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+  const backdrop = context.createRadialGradient(view.width / 2, view.height / 2, 0, view.width / 2, view.height / 2, Math.max(view.width, view.height) * 0.7);
+  backdrop.addColorStop(0, '#1d1d1c');
+  backdrop.addColorStop(1, theme.page);
+  context.globalAlpha = 1;
+  context.fillStyle = backdrop;
+  context.fillRect(0, 0, view.width, view.height);
+  context.font = FONT;
+  context.textBaseline = 'middle';
+  context.lineJoin = 'round';
+  context.lineCap = 'round';
+
+  context.strokeStyle = theme.axis;
+  context.lineWidth = 1;
+  context.beginPath();
+  shown.forEach((dir) => {
+    if (!dir.layoutParent) return;
+    const from = toScreen(dir.layoutParent);
+    const to = toScreen(dir);
+    context.moveTo(from.x, from.y);
+    context.lineTo(to.x, to.y);
+  });
+  context.stroke();
+
+  shown.forEach((dir) => {
+    const point = toScreen(dir);
+    if (dir.state === 'delete') {
+      drawMark(point.x, point.y, 'delete', 3 * dotScale);
+      return;
+    }
+    context.fillStyle = dir.layoutParent ? theme.muted : theme.ink;
+    context.beginPath();
+    context.arc(point.x, point.y, (dir.layoutParent ? 2.2 : 3.5) * dotScale, 0, TAU);
+    context.fill();
+  });
+
+  context.globalCompositeOperation = 'lighter';
+  files.forEach((file) => {
+    const heat = 1 - (now - file.lastTs) / HEAT_MS;
+    if (heat <= 0 || !visible(file) || time < file.bornAt) return;
+    const point = toScreen(file);
+    drawGlow(point.x, point.y, 15 * dotScale, theme[file.state], heat * 0.55);
+  });
+  context.globalCompositeOperation = 'source-over';
+
+  files.forEach((file) => {
+    if (time < file.bornAt) return;
+    const point = toScreen(file);
+    const born = clamp((time - file.bornAt) / POP_MS, 0, 1);
+    const pop = Math.max(0, 1 + 2.2 * (born - 1) ** 3 + 1.2 * (born - 1) ** 2);
+    const flash = clamp(1 - (time - file.flashAt) / ZAP_MS, 0, 1);
+    context.globalAlpha = visible(file) ? 1 - 0.6 * Math.min((now - file.lastTs) / fadeSpan, 1) : 0.08;
+    drawMark(point.x, point.y, file.state, 3.4 * dotScale * pop * (1 + flash * 0.8));
+    if (!overlapPaths.has(file.path)) return;
+    context.globalAlpha = 1;
+    context.setLineDash([3, 3]);
+    context.strokeStyle = theme.ink;
+    context.lineWidth = 1.5;
+    context.beginPath();
+    context.arc(point.x, point.y, 8.5 * dotScale, 0, TAU);
+    context.stroke();
+    context.setLineDash([]);
+  });
+
+  context.globalCompositeOperation = 'lighter';
+  zaps = zaps.filter((zap) => zap.start === null || time - zap.start < zap.boltMs + AFTERGLOW_MS);
+  zaps.filter((zap) => zap.start !== null).forEach((zap) => drawZap(zap, time, focus));
+  context.globalCompositeOperation = 'source-over';
+  context.globalAlpha = 1;
+
+  const liveAgents = [...agents.values()]
+    .filter((agent) => agent.node && now - agent.lastTs < LIVE_MS && (!focus || sessionOf(agent) === focus))
+    .sort((first, second) => second.lastTs - first.lastTs);
+  liveAgents.forEach((agent) => {
+    const point = agentPoint(agent, time);
+    const target = toScreen(agent.node);
+    const size = agent.parent ? 3.2 : 4.6;
+    context.globalAlpha = 0.25;
+    context.strokeStyle = theme.ink;
+    context.lineWidth = 1;
+    context.setLineDash([2, 4]);
+    context.beginPath();
+    context.moveTo(point.x, point.y);
+    context.lineTo(target.x, target.y);
+    context.stroke();
+    context.setLineDash([]);
+    context.globalCompositeOperation = 'lighter';
+    drawGlow(point.x, point.y, size * 4.5, theme.ink, 0.35 + 0.1 * Math.sin(time / 380 + angleOf(agent.id)));
+    context.globalCompositeOperation = 'source-over';
+    context.globalAlpha = 1;
+    context.fillStyle = theme.ink;
+    context.beginPath();
+    context.arc(point.x, point.y, size, 0, TAU);
+    context.fill();
+  });
+  liveAgents.forEach((agent) => {
+    const point = agentPoint(agent, time);
+    const text = agentLabel(agent);
+    drawLabel(text.length > 30 ? `${text.slice(0, 29)}…` : text, point.x + 10, point.y, theme.ink, placed);
+  });
+
+  files
+    .filter((file) => time >= file.bornAt && visible(file) && (overlapPaths.has(file.path) || file === hoveredNode || now - file.lastTs < HOT_LABEL_MS))
+    .sort((first, second) => overlapPaths.has(second.path) - overlapPaths.has(first.path) || second.lastTs - first.lastTs)
+    .slice(0, 40)
+    .forEach((file) => {
+      const point = toScreen(file);
+      const text = overlapPaths.has(file.path) ? `⚠ ${file.name}` : file.name;
+      drawLabel(text, point.x + 8 * dotScale, point.y, theme.ink2, placed);
+    });
+
+  [...shown]
+    .sort((first, second) => second.files.length - first.files.length)
+    .forEach((dir) => {
+      const point = toScreen(dir);
+      const text = dir.label.length > 34 ? `…${dir.label.slice(-33)}` : dir.label;
+      const width = context.measureText(text).width;
+      drawLabel(text, point.x - width / 2, point.y + dir.radius * view.k + 9, theme.muted, placed);
+    });
+}
+
+function frame(time) {
+  requestAnimationFrame(frame);
+  if (time > wakeUntil && time - lastDraw < 400) return;
+  const elapsed = Math.min(time - lastDraw, 1000);
+  lastDraw = time;
+  settleStructure();
+  relax();
+  follow(time, elapsed);
+  fitCamera();
+  draw(time);
+}
+
+function make(tag, className, text) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text !== undefined) element.textContent = text;
+  return element;
+}
+
+function renderFamily(family, now) {
+  const { session, members } = family;
+  const row = make('button', `row${now - family.lastTs > LIVE_MS ? ' idle' : ''}${pinnedSession === session.id ? ' pinned' : ''}`);
+  row.dataset.session = session.id;
+  row.title = pinnedSession === session.id ? 'Click to show every agent again' : 'Click to show only this session';
+  row.append(make('span', 'name', agentLabel(session)), make('span', 'ago', ago(family.lastTs)));
+  const parts = [row];
+  if (session.lastEvent) {
+    const { kind, via, path } = session.lastEvent;
+    const detail = make('div', 'detail');
+    detail.append(make('i', `mark ${kind}`), make('span', '', `‎${via === 'search' ? 'search' : kind} · ${path || repo}‎`));
+    parts.push(detail);
+  }
+  members
+    .sort((first, second) => second.lastTs - first.lastTs)
+    .slice(0, 6)
+    .forEach((member) => {
+      const line = make('div', `sub${now - member.lastTs > LIVE_MS ? ' idle' : ''}`);
+      const text = member.description ? `${agentLabel(member)} · ${member.description}` : agentLabel(member);
+      line.append(make('span', 'name', `↳ ${text}`), make('span', 'ago', ago(member.lastTs)));
+      parts.push(line);
+    });
+  if (members.length > 6) parts.push(make('div', 'sub idle', `↳ ${members.length - 6} more`));
+  return parts;
+}
+
+function renderPanel() {
+  panelDirty = false;
+  const now = Date.now();
+  const cutoff = cutoffNow();
+  const families = new Map();
+  [...agents.values()]
+    .filter((agent) => agent.lastEvent)
+    .forEach((agent) => {
+      const session = getAgent(sessionOf(agent));
+      const family = families.get(session.id) ?? { session, members: [], lastTs: 0, wt: null };
+      if (agent !== session) family.members.push(agent);
+      if (agent.lastTs > family.lastTs) Object.assign(family, { lastTs: agent.lastTs, wt: agent.lastEvent.wt });
+      families.set(session.id, family);
+    });
+
+  const groups = new Map();
+  [...families.values()]
+    .sort((first, second) => second.lastTs - first.lastTs)
+    .forEach((family) => groups.set(family.wt, [...(groups.get(family.wt) ?? []), family]));
+
+  const agentRows = [...groups].flatMap(([name, group]) => {
+    const heading = make('h2', '', name);
+    const branch = worktrees.get(name)?.branch;
+    heading.append(make('small', '', branch && branch !== name ? branch : worktrees.has(name) ? '' : 'removed worktree'));
+    return [heading, ...group.flatMap((family) => renderFamily(family, now))];
+  });
+  elements.agents.replaceChildren(...agentRows);
+
+  const overlaps = files.filter((file) => [...file.writers.values()].filter((ts) => ts >= cutoff).length > 1);
+  overlapPaths = new Set(overlaps.map((file) => file.path));
+  const overlapRows = overlaps.map((file) => {
+    const row = make('button', 'overlap');
+    row.dataset.path = file.path;
+    row.append(make('b', '', `⚠ ${file.path}`), make('span', '', [...file.writers.keys()].join(' · ')));
+    return row;
+  });
+  elements.overlaps.replaceChildren(...(overlaps.length ? [make('h2', '', 'Changed in two worktrees'), ...overlapRows] : []));
+
+  const active = [...agents.values()].filter((agent) => agent.lastEvent && now - agent.lastTs < LIVE_MS).length;
+  elements.summary.textContent = `${active} active · ${files.length} file${files.length === 1 ? '' : 's'} · ${overlaps.length} overlap${overlaps.length === 1 ? '' : 's'}`;
+  elements.empty.hidden = files.length > 0 || dirs.length > 1;
+  if (active) wake();
+}
+
+function showTooltip(node, x, y) {
+  const rows = [...node.touches]
+    .sort(([, first], [, second]) => second.ts - first.ts)
+    .slice(0, 6)
+    .map(([agentId, touch]) => {
+      const agent = getAgent(agentId);
+      const name = agent.parent ? `${agentLabel(getAgent(agent.parent))} › ${agentLabel(agent)}` : agentLabel(agent);
+      const counts = ACTIONS.filter((action) => touch[action]).map((action) => `${touch[action]} ${action}`).join(' · ');
+      const row = make('div');
+      row.append(make('span', '', `${name}: ${counts}`), make('em', '', ago(touch.ts)));
+      return row;
+    });
+  elements.tooltip.replaceChildren(make('b', '', node.path || repo), ...rows);
+  elements.tooltip.hidden = false;
+  const bounds = elements.tooltip.getBoundingClientRect();
+  elements.tooltip.style.left = `${clamp(x + 14, 8, view.width - bounds.width - 8)}px`;
+  elements.tooltip.style.top = `${clamp(y + 14, 8, view.height - bounds.height - 8)}px`;
+}
+
+function hover(x, y) {
+  const nearest = [...files, ...shown]
+    .map((node) => {
+      const point = toScreen(node);
+      return { node, distance: Math.hypot(point.x - x, point.y - y) };
+    })
+    .filter(({ distance }) => distance < 12)
+    .sort((first, second) => first.distance - second.distance)[0];
+  hoveredNode = nearest?.node ?? null;
+  if (hoveredNode) showTooltip(hoveredNode, x, y);
+  else elements.tooltip.hidden = true;
+}
+
+function resize() {
+  view.width = innerWidth;
+  view.height = innerHeight;
+  canvas.width = view.width * devicePixelRatio;
+  canvas.height = view.height * devicePixelRatio;
+  wake();
+}
+
+const handlers = {
+  init(message) {
+    repo = message.repo;
+    elements.repo.textContent = repo;
+    worktrees = new Map(message.worktrees.map((worktree) => [worktree.name, worktree]));
+    agents = new Map();
+    message.agents.forEach((agent) => Object.assign(getAgent(agent.id), agent));
+    log = message.events;
+    nodes = new Map();
+    rebuild();
+  },
+  event(message) {
+    log.push(message.event);
+    applyEvent(message.event, true);
+    panelDirty = true;
+    wake();
+  },
+  agent(message) {
+    Object.assign(getAgent(message.agent.id), message.agent);
+    panelDirty = true;
+  },
+  worktrees(message) {
+    worktrees = new Map(message.worktrees.map((worktree) => [worktree.name, worktree]));
+    panelDirty = true;
+  },
+};
+
+canvas.addEventListener('pointerdown', (event) => {
+  drag = { x: event.clientX, y: event.clientY };
+  canvas.setPointerCapture(event.pointerId);
+  canvas.classList.add('dragging');
+});
+canvas.addEventListener('pointermove', (event) => {
+  wake();
+  if (!drag) {
+    hover(event.clientX, event.clientY);
+    return;
+  }
+  view.autoFit = false;
+  view.x -= (event.clientX - drag.x) / view.k;
+  view.y -= (event.clientY - drag.y) / view.k;
+  drag = { x: event.clientX, y: event.clientY };
+});
+canvas.addEventListener('pointerup', () => {
+  drag = null;
+  canvas.classList.remove('dragging');
+});
+canvas.addEventListener('pointerleave', () => {
+  hoveredNode = null;
+  elements.tooltip.hidden = true;
+});
+canvas.addEventListener('wheel', (event) => {
+  event.preventDefault();
+  view.autoFit = false;
+  const before = toWorld(event.clientX, event.clientY);
+  view.k = clamp(view.k * Math.exp(-event.deltaY * 0.0015), 0.08, 6);
+  const after = toWorld(event.clientX, event.clientY);
+  view.x += before.x - after.x;
+  view.y += before.y - after.y;
+  wake();
+}, { passive: false });
+
+elements.agents.addEventListener('pointerover', (event) => {
+  hoveredSession = event.target.closest('[data-session]')?.dataset.session ?? null;
+  wake();
+});
+elements.agents.addEventListener('pointerleave', () => {
+  hoveredSession = null;
+  wake();
+});
+elements.agents.addEventListener('click', (event) => {
+  const session = event.target.closest('[data-session]')?.dataset.session;
+  if (!session) return;
+  pinnedSession = pinnedSession === session ? null : session;
+  renderPanel();
+  wake();
+});
+elements.overlaps.addEventListener('click', (event) => {
+  const node = nodes.get(event.target.closest('[data-path]')?.dataset.path);
+  if (!node) return;
+  Object.assign(view, { autoFit: false, x: node.x, y: node.y, k: 1.6 });
+  wake();
+});
+elements.trail.addEventListener('change', () => {
+  trailMs = elements.trail.value === 'all' ? Infinity : Number(elements.trail.value) * 60_000;
+  nodes = new Map();
+  rebuild();
+});
+elements.fit.addEventListener('click', () => {
+  view.autoFit = true;
+  wake();
+});
+addEventListener('keydown', (event) => {
+  if (event.key.toLowerCase() !== 'f' || event.target !== document.body) return;
+  view.autoFit = true;
+  wake();
+});
+addEventListener('resize', resize);
+
+const requestedTrail = new URLSearchParams(location.search).get('trail');
+if ([...elements.trail.options].some((option) => option.value === requestedTrail)) {
+  elements.trail.value = requestedTrail;
+  trailMs = requestedTrail === 'all' ? Infinity : Number(requestedTrail) * 60_000;
+}
+
+resize();
+ensureNode('', true);
+requestAnimationFrame(frame);
+setInterval(expire, 5000);
+setInterval(() => { if (panelDirty) renderPanel(); }, 250);
+setInterval(renderPanel, 1000);
+
+const source = new EventSource('/events');
+source.onopen = () => {
+  elements.status.textContent = 'live';
+  elements.status.className = 'live';
+};
+source.onerror = () => {
+  elements.status.textContent = 'reconnecting';
+  elements.status.className = '';
+};
+source.onmessage = ({ data }) => {
+  const message = JSON.parse(data);
+  handlers[message.type]?.(message);
+};
+</script>
+</body>
+</html>
