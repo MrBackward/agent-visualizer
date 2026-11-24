@@ -208,7 +208,7 @@ function getAgent(id) {
 }
 
 function agentLabel(agent) {
-  if (agent.parent) return agent.agentType ?? 'subagent';
+  if (agent.parent) return agent.description ?? agent.agentType ?? 'subagent';
   return agent.title ?? `Session ${agent.id.slice(0, 8)}`;
 }
 
@@ -407,6 +407,18 @@ function seedAll({ root }) {
   });
 }
 
+// A repo that turns up later joins the grid without moving the trees already there: beside the last one, or on a new row once that row is full.
+function nextTreeSpot() {
+  const placed = dirs.filter((dir) => dir.seeded && !dir.hidden);
+  const roots = placed.filter((dir) => !dir.parent);
+  const last = roots.at(-1);
+  if (!last) return { x: 0, y: 0 };
+  const row = roots.filter((root) => Math.abs(root.y - last.y) < 1);
+  const inRow = placed.filter((dir) => row.some((root) => root.repo === dir.repo));
+  if (row.length < gridColumns(roots.length + 1)) return { x: Math.max(...inRow.map((dir) => dir.x + dir.radius)) + TREE_GAP * 1.5, y: last.y };
+  return { x: Math.min(...roots.map((root) => root.x)), y: Math.max(...placed.map((dir) => dir.y + dir.radius)) + TREE_GAP * 2.5 };
+}
+
 function settleStructure() {
   dirs.forEach((dir) => { if (dir.dirty) arrange(dir); });
   if (!layoutDirty) return;
@@ -418,11 +430,7 @@ function settleStructure() {
     .map((root) => {
       const tree = { root, dirs: [] };
       const firstLoad = !dirs.some((dir) => dir.seeded && dir.parent && dir.repo === root.repo);
-      if (!root.seeded) {
-        const placed = dirs.filter((dir) => dir.seeded && !dir.hidden);
-        const neighbour = placed.findLast((dir) => !dir.parent);
-        Object.assign(root, { x: placed.length ? Math.max(...placed.map((dir) => dir.x + dir.radius)) + TREE_GAP * 1.5 : 0, y: neighbour?.y ?? 0, seeded: true });
-      }
+      if (!root.seeded) Object.assign(root, nextTreeSpot(), { seeded: true });
       const visit = (dir, layoutParent, prefix) => {
         const passThrough = dir.parent && !dir.files.length && dir.children.length === 1 && !dir.lastTs;
         dir.hidden = Boolean(passThrough);
@@ -449,9 +457,12 @@ function settleStructure() {
 const reachOf = (tree) => Math.max(...tree.dirs.map((dir) => Math.hypot(dir.x - tree.root.x, dir.y - tree.root.y) + dir.radius));
 const moveTree = (tree, dx, dy) => tree.dirs.forEach((dir) => Object.assign(dir, { x: dir.x + dx, y: dir.y + dy }));
 
+// e.g. 2 trees side by side, 3 or 4 as two rows of two, 5 to 9 in rows of three
+const gridColumns = (count) => Math.max(2, Math.ceil(Math.sqrt(count)));
+
 // First load only: trees go on a grid in the order their repos appeared, each cell sized to its tree.
 function arrangeTrees() {
-  const columns = Math.ceil(Math.sqrt(trees.length * 1.8));
+  const columns = gridColumns(trees.length);
   const sized = trees.map((tree) => ({ tree, reach: reachOf(tree) }));
   const rows = sized.reduce((list, entry, index) => {
     if (index % columns === 0) list.push([]);
@@ -963,8 +974,7 @@ function renderFamily(family, now) {
     .slice(0, 6)
     .forEach((member) => {
       const line = make('div', 'sub');
-      const text = member.description ? `${agentLabel(member)} · ${member.description}` : agentLabel(member);
-      line.append(statusDot(member, now), make('span', 'name', text), make('span', 'state', agentState(member, now, true)));
+      line.append(statusDot(member, now), make('span', 'name', agentLabel(member)), make('span', 'state', agentState(member, now, true)));
       parts.push(line);
     });
   if (members.length > 6) parts.push(make('div', 'detail', `${members.length - 6} more`));

@@ -213,9 +213,14 @@ function isIgnored({ repo, path }) {
   return chain.some((ancestor) => ignoredByPath.get(cacheKey(ancestor)));
 }
 
-function shellTouches(command, cwd) {
+// e.g. "cd ../api && npm test" run from /code/web -> /code/api
+function shellBase(command, cwd) {
   const changedTo = /^\s*cd\s+["']?([^"'\s;&]+)/.exec(command)?.[1];
-  const base = changedTo ? resolve(cwd, changedTo) : cwd;
+  return changedTo ? resolve(cwd, changedTo) : cwd;
+}
+
+function shellTouches(command, cwd) {
+  const base = shellBase(command, cwd);
   const unquote = (word) => word.replace(/^["'`]+|["'`]+$/g, '');
   const plain = (token) => token.length > 2 && token.length < 260 && !token.startsWith('-') && !/[*?$\\{}~<>&|]/.test(token);
   const removed = new Set(
@@ -298,7 +303,9 @@ function ingestBlock(block, cwd, ts, agent) {
     pendingFileCalls.set(block.id, block.input?.file_path ?? block.input?.notebook_path);
     return;
   }
-  const check = SHELL_TOOLS.has(block.name) ? validationLabel(block.input?.command ?? '') : null;
+  // A check only counts when it runs inside a repo on screen, so a session working elsewhere stays out of the box.
+  const command = block.input?.command ?? '';
+  const check = SHELL_TOOLS.has(block.name) && locate(shellBase(command, cwd)) ? validationLabel(command) : null;
   if (check) {
     agent.checks.set(block.id, { label: check, since: ts });
     publishChecks(agent);
